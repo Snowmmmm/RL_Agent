@@ -1,5 +1,5 @@
 ### 1. 环境准备
-
+运行环境 python3.12
 ```bash
 cd RL_Agent
 # 安装依赖
