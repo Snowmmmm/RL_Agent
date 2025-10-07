@@ -175,13 +175,13 @@ class HotelEnvironment:
             'weekday': weekday_type
         }
     
-    def step(self, action: int, bnn_predictor: Optional[Any] = None, date_features: Optional[np.ndarray] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: int, bnn_predictor_online: Optional[Any] = None, bnn_predictor_offline: Optional[Any] = None, date_features: Optional[np.ndarray] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         执行一步酒店定价决策
         
         根据给定的定价动作，模拟一天的酒店运营过程，包括：
         1. 确定定价：将动作索引转换为具体价格
-        2. 需求预测：使用BNN模型预测需求分布
+        2. 需求预测：使用线上和线下BNN模型预测需求分布，并相加结果
         3. 预订处理：根据库存限制确定实际预订量
         4. 收益计算：计算当日收益和未来预期收益
         5. 风险惩罚：基于预测方差添加风险惩罚
@@ -190,7 +190,8 @@ class HotelEnvironment:
         
         Args:
             action (int): 定价动作索引（0-5，对应6个价格档位）
-            bnn_predictor (Optional[Any], optional): BNN需求预测器
+            bnn_predictor_online (Optional[Any], optional): 线上用户BNN需求预测器
+            bnn_predictor_offline (Optional[Any], optional): 线下用户BNN需求预测器
             date_features (Optional[np.ndarray], optional): 日期特征数据
             
         Returns:
@@ -209,6 +210,7 @@ class HotelEnvironment:
                 
         Note:
             - 价格档位：60, 90, 120, 150, 180, 210
+            - 需求预测为线上和线下BNN预测结果相加
             - 收益计算考虑当日入住和未来预期入住
             - 风险惩罚系数按季节调整（旺季0.1，平季0.25，淡季0.5）
             - 库存更新使用β系数分布，反映不同入住天数的影响
@@ -219,14 +221,32 @@ class HotelEnvironment:
         prices = [60, 90, 120, 150, 180, 210]
         price = prices[action]
         
-        # 使用BNN预测需求
-        if bnn_predictor is not None and date_features is not None:
-            # 获取BNN预测 - 传入动作索引，BNN预测器会转换为对应价格
-            predicted_demand, predicted_variance = bnn_predictor(date_features, action)
+        # 使用线上和线下BNN预测需求，并相加结果
+        predicted_demand_online = 0
+        predicted_variance_online = 0
+        predicted_demand_offline = 0
+        predicted_variance_offline = 0
+        
+        if date_features is not None:
+            # 获取线上用户BNN预测
+            if bnn_predictor_online is not None:
+                demand_online, variance_online = bnn_predictor_online(date_features, action)
+                predicted_demand_online = demand_online
+                predicted_variance_online = variance_online
             
-            # 添加一些随机性
-            actual_demand = max(0, int(np.random.normal(predicted_demand, np.sqrt(predicted_variance)))) # 从以 predicted_demand 为均值、以 predicted_variance 的平方根为标准差的正态分布中，随机生成一个数值
-            # actual_demand = max(0, predicted_demand)
+            # 获取线下用户BNN预测
+            if bnn_predictor_offline is not None:
+                demand_offline, variance_offline = bnn_predictor_offline(date_features, action)
+                predicted_demand_offline = demand_offline
+                predicted_variance_offline = variance_offline
+        
+        # 总预测需求 = 线上预测需求 + 线下预测需求
+        predicted_demand = predicted_demand_online + predicted_demand_offline
+        # 总预测方差 = 线上预测方差 + 线下预测方差（假设独立）
+        predicted_variance = predicted_variance_online + predicted_variance_offline
+        
+        # 添加一些随机性到实际需求
+        actual_demand = max(0, int(np.random.normal(predicted_demand, np.sqrt(predicted_variance))))
         # else:
         #     # 如果没有BNN预测器，使用简单的需求模型
         #     base_demand = 30
@@ -256,7 +276,7 @@ class HotelEnvironment:
         total_revenue = today_revenue + future_expected_revenue
         
         # 动态风险惩罚系数（按季节调整）
-        if bnn_predictor is not None:
+        if bnn_predictor_online is not None or bnn_predictor_offline is not None:
             # 获取当前状态信息
             state_info = self._get_state()
             
@@ -290,8 +310,8 @@ class HotelEnvironment:
         self.daily_history.append({
             'day': self.day,
             'price': price,
-            'predicted_demand': predicted_demand if bnn_predictor else actual_demand,
-            'predicted_variance': predicted_variance if bnn_predictor else 0,
+            'predicted_demand': predicted_demand if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else actual_demand,
+            'predicted_variance': predicted_variance if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else 0,
             'actual_demand': actual_demand,
             'actual_bookings': actual_bookings,
             'inventory_before': self.current_inventory + actual_bookings,
@@ -308,8 +328,8 @@ class HotelEnvironment:
         done = (self.day >= 90)  # 90天规划周期，不考虑库存耗尽
         
         return new_state, reward, done, {
-            'predicted_demand': predicted_demand if bnn_predictor else actual_demand,
-            'predicted_variance': predicted_variance if bnn_predictor else 0,
+            'predicted_demand': predicted_demand if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else actual_demand,
+            'predicted_variance': predicted_variance if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else 0,
             'actual_bookings': actual_bookings,
             'revenue': total_revenue
         }
@@ -558,17 +578,18 @@ class QLearningAgent:
         
         return new_q
     
-    def train_episode(self, env: HotelEnvironment, bnn_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, episode: int = 0) -> Tuple[float, int]:
+    def train_episode(self, env: HotelEnvironment, online_bnn_predictor: Optional[Any] = None, offline_bnn_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, episode: int = 0) -> Tuple[float, int]:
         """
         训练一个episode（完整的酒店定价周期）
         
         功能描述：
         执行完整的酒店定价决策周期，从环境重置到episode结束，记录完整的训练和交互过程。
-        支持BNN预测器集成、多阶段收益计算、详细日志记录等功能。
+        支持两个BNN预测器集成、多阶段收益计算、详细日志记录等功能。
         
         参数:
             env (HotelEnvironment): 酒店环境实例
-            bnn_predictor (Optional[Any]): BNN预测器包装器，用于需求预测
+            online_bnn_predictor (Optional[Any]): 线上用户BNN预测器包装器
+            offline_bnn_predictor (Optional[Any]): 线下用户BNN预测器包装器
             date_features (Optional[pd.DataFrame]): 日期特征数据，包含季节、工作日等信息
             episode (int): 当前episode编号，用于控制探索率衰减
             
@@ -579,7 +600,7 @@ class QLearningAgent:
         1. 环境初始化：重置酒店环境到初始状态
         2. 状态获取：获取当前库存、季节、日期类型等状态信息
         3. 动作选择：基于ε-贪心策略选择定价动作
-        4. 环境交互：执行定价决策，获取奖励和下一状态
+        4. 环境交互：执行定价决策，使用两个BNN预测器获取奖励和下一状态
         5. Q表更新：使用Q-learning算法更新价值函数
         6. 数据记录：记录每日决策、奖励、库存变化等信息
         7. 循环执行：重复步骤3-6直到episode结束
@@ -587,7 +608,7 @@ class QLearningAgent:
         
         Note:
         - 支持最大200步限制，防止无限循环
-        - 集成BNN预测器进行需求预测和不确定性估计
+        - 集成两个BNN预测器分别预测线上和线下用户需求
         - 记录详细的每日决策信息用于后续分析
         - 使用episode计数器控制探索率衰减
         - 支持多阶段收益计算（当日收益+未来预期收益）
@@ -624,8 +645,8 @@ class QLearningAgent:
             current_inventory = state_info['inventory_raw']
             future_inventory = state_info.get('future_inventory', [])
             
-            # 执行动作
-            next_state_info, reward, done, info = env.step(action, bnn_predictor, date_features)
+            # 执行动作，使用两个BNN预测器
+            next_state_info, reward, done, info = env.step(action, online_bnn_predictor, offline_bnn_predictor, date_features)
             
             # 获取BNN预测的需求信息
             predicted_demand = info.get('predicted_demand', 0)
@@ -988,11 +1009,14 @@ class HotelRLSystem:
         - 支持90天的完整定价周期模拟
     """
     
-    def __init__(self, bnn_trainer: Any, preprocessor: Any, demand_scaler: Optional[Any] = None, 
+    def __init__(self, online_bnn_trainer: Any, offline_bnn_trainer: Any, preprocessor: Any, 
+                 online_demand_scaler: Optional[Any] = None, offline_demand_scaler: Optional[Any] = None,
                  epsilon_start: float = 0.9, epsilon_end: float = 0.1, epsilon_decay_episodes: int = 400) -> None:
-        self.bnn_trainer = bnn_trainer
+        self.online_bnn_trainer = online_bnn_trainer
+        self.offline_bnn_trainer = offline_bnn_trainer
         self.preprocessor = preprocessor
-        self.bnn_predictor = BNNPredictorWrapper(bnn_trainer, preprocessor, demand_scaler)
+        self.online_bnn_predictor = BNNPredictorWrapper(online_bnn_trainer, preprocessor, online_demand_scaler)
+        self.offline_bnn_predictor = BNNPredictorWrapper(offline_bnn_trainer, preprocessor, offline_demand_scaler)
         self.agent = QLearningAgent(
             epsilon_start=epsilon_start,
             epsilon_end=epsilon_end,
@@ -1063,9 +1087,9 @@ class HotelRLSystem:
             if len(episode_features) < 2:  # 至少需要2天数据
                 continue
                 
-            # 训练一个episode
+            # 训练一个episode，使用两个BNN预测器
             total_reward, steps = self.agent.train_episode(
-                self.env, self.bnn_predictor, episode_features, episode
+                self.env, self.online_bnn_predictor, self.offline_bnn_predictor, episode_features, episode
             )
             
             # 记录训练指标
@@ -1175,9 +1199,9 @@ class HotelRLSystem:
             # 在线学习时主要利用已有知识，少量探索
             action = self.agent.select_action(state, episode_counter)
             
-            # 执行动作并获取反馈
+            # 执行动作并获取反馈，使用两个BNN预测器
             next_state_info, reward, done, info = self.env.step(
-                action, self.bnn_predictor, day_features
+                action, self.online_bnn_predictor, self.offline_bnn_predictor, day_features
             )
             
             # 修复2: 放宽数据收集条件 - 收集所有有意义的交互

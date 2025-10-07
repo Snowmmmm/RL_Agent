@@ -79,6 +79,7 @@ class HotelDataPreprocessor:
            - ADR（平均日房价）限制在0-500元范围内
            - 成人数限制在最多4人
            - 入住天数限制在最多5晚（周末+工作日）
+        3. 客户分类：根据市场细分和分销渠道区分线上用户和线下用户
         
         这些清洗规则基于酒店业务的合理范围设定，可以有效去除数据中的异常记录。
         
@@ -86,12 +87,13 @@ class HotelDataPreprocessor:
             df (pd.DataFrame): 原始酒店预订数据框
             
         Returns:
-            pd.DataFrame: 清洗后的数据框
+            pd.DataFrame: 清洗后的数据框，包含客户分类字段
             
         Note:
             - ADR超过500元的记录会被截断为500元
             - 成人数超过4人的记录会被截断为4人
             - 入住天数超过5晚的记录会被调整为2晚周末+3晚工作日
+            - 客户分类逻辑：市场细分='Online TA' 或 分销渠道='TA/TO' 为线上用户
         """
         print("正在清洗数据...")
         
@@ -112,16 +114,29 @@ class HotelDataPreprocessor:
         df.loc[df['stays_in_weekend_nights'] + df['stays_in_week_nights'] > 5, 
                ['stays_in_weekend_nights', 'stays_in_week_nights']] = [2, 3]
         
+        # 客户分类：区分线上用户与线下用户
+        def classify_customer(row):
+            if row['market_segment'] == 'Online TA' or row['distribution_channel'] == 'TA/TO':
+                return '线上用户'
+            else:
+                return '线下用户'
+        
+        df['customer_type'] = df.apply(classify_customer, axis=1)
+        
+        # 统计客户类型分布
+        customer_type_counts = df['customer_type'].value_counts()
+        print(f"客户类型分布：{customer_type_counts.to_dict()}")
+        
         return df
     
-    def construct_daily_demand_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+    def construct_daily_demand_labels(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        构造每日需求标签（包含真实价格信息）
+        构造每日需求标签（区分线上和线下用户）
         
-        基于原始酒店预订数据构造每日需求标签，这是监督学习的核心步骤：
-        1. 创建到达日期字段，组合年、月、日信息
+        基于酒店预订数据构造每日需求标签，分别统计线上和线下用户的需求：
+        1. 创建到达日期
         2. 筛选有效预订（未取消且实际入住的订单）
-        3. 按日期分组统计每日的需求量和价格分布
+        3. 根据客户类型分别统计每日需求、平均价格和价格分布
         4. 填充缺失的日期，确保时间序列连续性
         5. 对无订单的日期进行价格信息插值填充
         
@@ -129,15 +144,15 @@ class HotelDataPreprocessor:
             df (pd.DataFrame): 清洗后的酒店预订数据
             
         Returns:
-            pd.DataFrame: 包含每日需求量和价格统计的数据框
-            列包括：date, daily_demand, avg_price, price_std, min_price, max_price, median_price
+            tuple[pd.DataFrame, pd.DataFrame]: 线上和线下用户的每日需求数据框
+            列包括：date, daily_demand, avg_price, price_std, min_price, max_price, median_price, customer_type
             
         Note:
             - 只考虑未取消且实际入住的订单作为有效需求
             - 对缺失日期使用0填充需求量，价格信息通过插值填充
             - 价格插值使用相邻日期的价格信息，最后用整体平均值兜底
         """
-        print("正在构造每日需求标签...")
+        print("正在构造每日需求标签（区分线上和线下用户）...")
         
         # 创建到达日期
         df['arrival_date'] = pd.to_datetime(
@@ -152,47 +167,82 @@ class HotelDataPreprocessor:
             (df['stays_in_weekend_nights'] + df['stays_in_week_nights'] >= 1)
         ].copy()
         
-        # 按日期分组统计每日需求、平均价格和价格分布
-        daily_stats = valid_bookings.groupby('arrival_date').agg({
-            'adr': ['count', 'mean', 'std', 'min', 'max', 'median']
-        }).round(2)
+        # 分别处理线上和线下用户
+        online_bookings = valid_bookings[valid_bookings['customer_type'] == '线上用户'].copy()
+        offline_bookings = valid_bookings[valid_bookings['customer_type'] == '线下用户'].copy()
         
-        # 重命名列
-        daily_stats.columns = ['daily_demand', 'avg_price', 'price_std', 'min_price', 'max_price', 'median_price']
-        daily_stats = daily_stats.reset_index()
-        daily_stats.rename(columns={'arrival_date': 'date'}, inplace=True)
+        print(f"有效订单总数: {len(valid_bookings)}")
+        print(f"线上用户订单数: {len(online_bookings)} ({len(online_bookings)/len(valid_bookings)*100:.1f}%)")
+        print(f"线下用户订单数: {len(offline_bookings)} ({len(offline_bookings)/len(valid_bookings)*100:.1f}%)")
         
-        # 填充缺失的日期
-        date_range = pd.date_range(daily_stats['date'].min(), daily_stats['date'].max())
-        daily_stats = daily_stats.set_index('date').reindex(date_range, fill_value=0).reset_index()
-        daily_stats.rename(columns={'index': 'date'}, inplace=True)
+        def create_daily_stats(bookings, customer_type):
+            """为指定客户类型创建每日统计"""
+            if len(bookings) == 0:
+                # 如果没有该类型的订单，创建空的数据框
+                daily_stats = pd.DataFrame(columns=['date', 'daily_demand', 'avg_price', 'price_std', 'min_price', 'max_price', 'median_price'])
+                return daily_stats
+                
+            # 按日期分组统计每日需求、平均价格和价格分布
+            daily_stats = bookings.groupby('arrival_date').agg({
+                'adr': ['count', 'mean', 'std', 'min', 'max', 'median']
+            }).round(2)
+            
+            # 重命名列
+            daily_stats.columns = ['daily_demand', 'avg_price', 'price_std', 'min_price', 'max_price', 'median_price']
+            daily_stats = daily_stats.reset_index()
+            daily_stats.rename(columns={'arrival_date': 'date'}, inplace=True)
+            daily_stats['customer_type'] = customer_type
+            
+            return daily_stats
         
-        # 对没有订单的日期，填充价格统计信息
-        daily_stats['avg_price'] = daily_stats['avg_price'].replace(0, np.nan)
-        daily_stats['price_std'] = daily_stats['price_std'].replace(0, np.nan)
-        daily_stats['min_price'] = daily_stats['min_price'].replace(0, np.nan)
-        daily_stats['max_price'] = daily_stats['max_price'].replace(0, np.nan)
-        daily_stats['median_price'] = daily_stats['median_price'].replace(0, np.nan)
+        # 分别为线上和线下用户创建每日统计
+        online_daily_stats = create_daily_stats(online_bookings, '线上用户')
+        offline_daily_stats = create_daily_stats(offline_bookings, '线下用户')
         
-        # 用相邻日期的价格信息填充
-        daily_stats['avg_price'] = daily_stats['avg_price'].interpolate()
-        daily_stats['price_std'] = daily_stats['price_std'].interpolate()
-        daily_stats['min_price'] = daily_stats['min_price'].interpolate()
-        daily_stats['max_price'] = daily_stats['max_price'].interpolate()
-        daily_stats['median_price'] = daily_stats['median_price'].interpolate()
+        # 获取完整的日期范围（基于所有有效订单）
+        if len(valid_bookings) > 0:
+            date_range = pd.date_range(valid_bookings['arrival_date'].min(), valid_bookings['arrival_date'].max())
+            
+            # 为线上用户数据填充缺失日期
+            online_daily_stats = online_daily_stats.set_index('date').reindex(date_range, fill_value=0).reset_index()
+            online_daily_stats.rename(columns={'index': 'date'}, inplace=True)
+            online_daily_stats['customer_type'] = '线上用户'
+            
+            # 为线下用户数据填充缺失日期
+            offline_daily_stats = offline_daily_stats.set_index('date').reindex(date_range, fill_value=0).reset_index()
+            offline_daily_stats.rename(columns={'index': 'date'}, inplace=True)
+            offline_daily_stats['customer_type'] = '线下用户'
+            
+            # 对没有订单的日期，填充价格统计信息
+            for stats_df, bookings in [(online_daily_stats, online_bookings), (offline_daily_stats, offline_bookings)]:
+                if len(bookings) > 0:
+                    # 将0值替换为NaN以便插值
+                    for col in ['avg_price', 'price_std', 'min_price', 'max_price', 'median_price']:
+                        stats_df[col] = stats_df[col].replace(0, np.nan)
+                    
+                    # 用相邻日期的价格信息填充
+                    stats_df['avg_price'] = stats_df['avg_price'].interpolate()
+                    stats_df['price_std'] = stats_df['price_std'].interpolate()
+                    stats_df['min_price'] = stats_df['min_price'].interpolate()
+                    stats_df['max_price'] = stats_df['max_price'].interpolate()
+                    stats_df['median_price'] = stats_df['median_price'].interpolate()
+                    
+                    # 如果还有缺失，用该客户类型的整体平均值填充
+                    stats_df['avg_price'] = stats_df['avg_price'].fillna(bookings['adr'].mean())
+                    stats_df['price_std'] = stats_df['price_std'].fillna(bookings['adr'].std())
+                    stats_df['min_price'] = stats_df['min_price'].fillna(bookings['adr'].min())
+                    stats_df['max_price'] = stats_df['max_price'].fillna(bookings['adr'].max())
+                    stats_df['median_price'] = stats_df['median_price'].fillna(bookings['adr'].median())
         
-        # 如果还有缺失，用整体平均值填充
-        overall_avg_price = valid_bookings['adr'].mean()
-        daily_stats['avg_price'] = daily_stats['avg_price'].fillna(overall_avg_price)
-        daily_stats['price_std'] = daily_stats['price_std'].fillna(valid_bookings['adr'].std())
-        daily_stats['min_price'] = daily_stats['min_price'].fillna(valid_bookings['adr'].min())
-        daily_stats['max_price'] = daily_stats['max_price'].fillna(valid_bookings['adr'].max())
-        daily_stats['median_price'] = daily_stats['median_price'].fillna(valid_bookings['adr'].median())
+        print(f"线上用户需求标签构造完成，共{len(online_daily_stats)}天数据")
+        print(f"线下用户需求标签构造完成，共{len(offline_daily_stats)}天数据")
         
-        print(f"需求标签构造完成，共{len(daily_stats)}天数据")
-        print(f"价格统计 - 平均价格: {valid_bookings['adr'].mean():.2f}, 价格范围: {valid_bookings['adr'].min():.2f}-{valid_bookings['adr'].max():.2f}")
+        if len(online_bookings) > 0:
+            print(f"线上用户价格统计 - 平均价格: {online_bookings['adr'].mean():.2f}, 价格范围: {online_bookings['adr'].min():.2f}-{online_bookings['adr'].max():.2f}")
+        if len(offline_bookings) > 0:
+            print(f"线下用户价格统计 - 平均价格: {offline_bookings['adr'].mean():.2f}, 价格范围: {offline_bookings['adr'].min():.2f}-{offline_bookings['adr'].max():.2f}")
         
-        return daily_stats
+        return online_daily_stats, offline_daily_stats
     
     def construct_features(self, daily_stats: pd.DataFrame) -> pd.DataFrame:
         """

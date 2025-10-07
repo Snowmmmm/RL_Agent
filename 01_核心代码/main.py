@@ -230,11 +230,11 @@ def plot_confidence_interval_coverage(y_true: np.ndarray, mean_pred: np.ndarray,
     print(f"标准化残差均值: {np.mean(standardized_residuals):.4f}")
     print(f"标准化残差标准差: {np.std(standardized_residuals):.4f}")
 
-def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> Tuple[HotelDataPreprocessor, pd.DataFrame]:
+def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> Tuple[HotelDataPreprocessor, pd.DataFrame, pd.DataFrame]:
     """
-    加载和预处理数据
+    加载和预处理数据（区分线上和线下用户）
     
-    加载酒店预订数据并进行预处理，包括特征工程、数据清洗和标准化。
+    加载酒店预订数据并进行预处理，分别处理线上和线下用户的数据。
     支持缓存机制避免重复预处理，提高开发效率。
     
     Args:
@@ -242,13 +242,14 @@ def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> T
         force_reprocess: 是否强制重新预处理数据，忽略缓存
         
     Returns:
-        Tuple[HotelDataPreprocessor, pd.DataFrame]: (预处理器对象, 处理后的特征数据)
+        Tuple[HotelDataPreprocessor, pd.DataFrame, pd.DataFrame]: (预处理器对象, 线上用户特征数据, 线下用户特征数据)
         
     处理流程：
     1. 检查缓存文件是否存在
     2. 如不存在或强制重新处理，执行完整预处理
-    3. 保存预处理结果到缓存文件
-    4. 返回预处理器和处理后的数据
+    3. 分别处理线上和线下用户数据
+    4. 保存预处理结果到缓存文件
+    5. 返回预处理器和处理后的数据
     
     Note:
         - 自动检测和使用已有的预处理结果
@@ -256,199 +257,223 @@ def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> T
         - 缓存文件包括预处理器参数和处理后的数据
         - 提供详细的处理进度报告
     """
-    print("\n=== 数据预处理 ===")
+    print("\n=== 数据预处理（区分线上和线下用户） ===")
     
     preprocessor_path = '../02_训练模型/preprocessor.pkl'
-    processed_data_path = '../03_数据文件/processed_features.csv'
+    online_data_path = '../03_数据文件/online_features.csv'
+    offline_data_path = '../03_数据文件/offline_features.csv'
     
     # 检查是否已有预处理结果
-    if not force_reprocess and os.path.exists(preprocessor_path) and os.path.exists(processed_data_path):
+    if not force_reprocess and os.path.exists(preprocessor_path) and os.path.exists(online_data_path) and os.path.exists(offline_data_path):
         print("发现已有的预处理结果，正在加载...")
         preprocessor = HotelDataPreprocessor.load_preprocessor(preprocessor_path)
-        features_df = pd.read_csv(processed_data_path)
-        print(f"[OK] 预处理数据加载完成，共{len(features_df)}条记录")
+        online_features_df = pd.read_csv(online_data_path)
+        offline_features_df = pd.read_csv(offline_data_path)
+        print(f"[OK] 线上用户数据加载完成，共{len(online_features_df)}条记录")
+        print(f"[OK] 线下用户数据加载完成，共{len(offline_features_df)}条记录")
     else:
         if force_reprocess:
             print("强制重新执行数据预处理...")
         else:
             print("正在执行数据预处理...")
         preprocessor = HotelDataPreprocessor()
-        features_df = preprocessor.load_and_preprocess_data(data_path)
+        
+        # 加载原始数据
+        raw_df = pd.read_csv(data_path)
+        print(f"数据加载完成，共{len(raw_df)}条记录")
+        
+        # 数据清洗
+        cleaned_df = preprocessor.clean_data(raw_df)
+        
+        # 分别为线上和线下用户构造需求标签
+        online_daily_stats, offline_daily_stats = preprocessor.construct_daily_demand_labels(cleaned_df)
+        
+        # 分别为线上和线下用户构造特征
+        online_features_df = preprocessor.construct_features(online_daily_stats)
+        offline_features_df = preprocessor.construct_features(offline_daily_stats)
         
         # 保存预处理结果
-        features_df.to_csv(processed_data_path, index=False)
+        online_features_df.to_csv(online_data_path, index=False)
+        offline_features_df.to_csv(offline_data_path, index=False)
         preprocessor.save_preprocessor(preprocessor_path)
         print("[OK] 数据预处理完成")
     
-    return preprocessor, features_df
+    return preprocessor, online_features_df, offline_features_df
 
-def train_bnn_model(preprocessor: HotelDataPreprocessor, features_df: pd.DataFrame, force_retrain: bool = False) -> Tuple[BNNTrainer, StandardScaler]:
+def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd.DataFrame, offline_features_df: pd.DataFrame, force_retrain: bool = False) -> Tuple[BNNTrainer, BNNTrainer, StandardScaler, StandardScaler]:
     """
-    训练BNN模型
+    分别为线上和线下用户训练BNN模型
     
-    训练贝叶斯神经网络模型用于需求预测，包括数据准备、模型训练和性能评估。
+    分别为线上和线下用户训练贝叶斯神经网络模型用于需求预测，包括数据准备、模型训练和性能评估。
     支持模型缓存和增量训练，提供详细的训练过程监控。
     
     Args:
         preprocessor: 数据预处理器对象，包含特征工程方法
-        features_df: 特征数据DataFrame，包含原始特征和需求数据
+        online_features_df: 线上用户特征数据DataFrame
+        offline_features_df: 线下用户特征数据DataFrame
         force_retrain: 是否强制重新训练模型，忽略已有模型
         
     Returns:
-        Tuple[BNNTrainer, StandardScaler]: (BNN训练器, 需求标准化器)
+        Tuple[BNNTrainer, BNNTrainer, StandardScaler, StandardScaler]: (线上BNN训练器, 线下BNN训练器, 线上需求标准化器, 线下需求标准化器)
         
     训练流程：
-    1. 数据标准化：对需求数据进行标准化处理
-    2. 样本构建：使用真实价格数据创建训练样本
-    3. 数据划分：按70%/15%/15%分割训练/验证/测试集
-    4. 模型训练：使用配置参数训练BNN模型
-    5. 性能评估：计算MAE和置信区间覆盖率
+    1. 分别为线上和线下用户进行数据标准化
+    2. 分别为两类用户构造训练样本
+    3. 分别训练BNN模型
+    4. 分别评估模型性能
     
     Note:
-        - 使用需求标准化器确保数值稳定性
+        - 分别为两类用户使用独立的需求标准化器
         - 支持模型缓存避免重复训练
         - 提供详细的训练进度和性能报告
         - 包含置信区间覆盖率评估
     """
-    print("\n=== BNN模型训练 ===")
+    print("\n=== BNN模型训练（区分线上和线下用户） ===")
     
-    model_path = '../02_训练模型/bnn_model.pth'
+    online_model_path = '../02_训练模型/bnn_model_online.pth'
+    offline_model_path = '../02_训练模型/bnn_model_offline.pth'
     
-    # 准备训练数据
-    print("正在准备训练数据...")
-    
-    # 对需求数据进行标准化
-    demand_scaler = StandardScaler()
-    original_demands = features_df['daily_demand'].values.reshape(-1, 1)
-    standardized_demands = demand_scaler.fit_transform(original_demands).flatten()
-    
+    def train_single_bnn_model(features_df, model_path, customer_type):
+        """为单个客户类型训练BNN模型"""
+        print(f"\n正在为{customer_type}训练BNN模型...")
+        
+        # 对需求数据进行标准化
+        demand_scaler = StandardScaler()
+        original_demands = features_df['daily_demand'].values.reshape(-1, 1)
+        standardized_demands = demand_scaler.fit_transform(original_demands).flatten()
+        
+        # 保存标准化器
+        scaler_path = f'../02_训练模型/demand_scaler_{customer_type}.pkl'
+        joblib.dump(demand_scaler, scaler_path)
+        
+        # 构造训练特征和标签
+        X_list = []
+        y_list = []
+        
+        print(f"正在为{customer_type}使用真实价格数据创建训练样本...")
+        
+        # 使用真实价格数据创建训练样本
+        for idx, row in features_df.iterrows():
+            # 使用标准化后的需求作为目标
+            standardized_demand = standardized_demands[idx]
+            
+            # 使用真实平均价格作为价格特征
+            avg_price = row.get('avg_price', 120)  # 默认120如果缺失
+            if pd.isna(avg_price) or avg_price <= 0:
+                avg_price = 120  # 使用默认值
+            
+            # 准备特征
+            features = preprocessor.prepare_bnn_features(features_df.iloc[idx:idx+1], price_action=avg_price)
+            
+            # 添加少量噪声到标准化需求数据
+            noisy_demand = standardized_demand + np.random.normal(0, 0.05)  # 很小的噪声
+            
+            X_list.append(features.numpy())
+            y_list.append(noisy_demand)
+        
+        X = np.array(X_list)
+        y = np.array(y_list)
+        
+        print(f"{customer_type}训练数据构造完成：X形状{X.shape}, y形状{y.shape}")
+        print(f"{customer_type}目标值范围：{y.min():.3f} - {y.max():.3f}（标准化后）")
+        
+        # 划分训练集、验证集和测试集
+        n_samples = len(X)
+        train_size = int(0.7 * n_samples)
+        val_size = int(0.15 * n_samples)
+        
+        X_train = X[:train_size]
+        y_train = y[:train_size]
+        X_val = X[train_size:train_size + val_size]
+        y_val = y[train_size:train_size + val_size]
+        X_test = X[train_size + val_size:]
+        y_test = y[train_size + val_size:]
 
-    joblib.dump(demand_scaler, '../02_训练模型/demand_scaler_main.pkl')
-    
-    # 构造训练特征和标签
-    X_list = []
-    y_list = []
-    
-    print("正在使用真实价格数据创建训练样本...")
-    
-    # 检查是否有价格数据
-    price_cols = ['avg_price', 'price_std', 'min_price', 'max_price', 'median_price']
-    has_price_data = any(col in features_df.columns for col in price_cols)
-    
-
-    # 使用真实价格数据创建训练样本
-    for idx, row in features_df.iterrows():
-        # 使用标准化后的需求作为目标
-        standardized_demand = standardized_demands[idx]
-        
-        # 使用真实平均价格作为价格特征
-        avg_price = row.get('avg_price', 120)  # 默认120如果缺失
-        if pd.isna(avg_price) or avg_price <= 0:
-            avg_price = 120  # 使用默认值
-        
-        # 准备特征
-        features = preprocessor.prepare_bnn_features(features_df.iloc[idx:idx+1], price_action=avg_price) #
-        
-        # 添加少量噪声到标准化需求数据
-        noisy_demand = standardized_demand + np.random.normal(0, 0.05)  # 很小的噪声
-        
-        X_list.append(features.numpy())
-        y_list.append(noisy_demand)
-    
-    X = np.array(X_list)
-    y = np.array(y_list)
-    
-    print(f"训练数据构造完成：X形状{X.shape}, y形状{y.shape}")
-    print(f"目标值范围：{y.min():.3f} - {y.max():.3f}（标准化后）")
-    
-    # 划分训练集、验证集和测试集
-    n_samples = len(X)
-    train_size = int(0.7 * n_samples)
-    val_size = int(0.15 * n_samples)
-    
-    X_train = X[:train_size]
-    y_train = y[:train_size]
-    X_val = X[train_size:train_size + val_size]
-    y_val = y[train_size:train_size + val_size]
-    X_test = X[train_size + val_size:]
-    y_test = y[train_size + val_size:]
-
-    # 检查是否已有训练好的模型
-    if not force_retrain and os.path.exists(model_path):
-        print("发现已有的BNN模型，正在加载...")
-        bnn_trainer = BNNTrainer(
-            input_dim=X.shape[1],
-            hidden_dims=BNN_CONFIG['hidden_dims'],  # 使用配置文件中的网络结构
-            learning_rate=BNN_CONFIG['learning_rate'],  # 使用配置文件中的学习率
-            weight_decay=BNN_CONFIG['weight_decay'],   # 使用配置文件中的权重衰减
-            device='cuda' if torch.cuda.is_available() else 'cpu'
-        )
-        bnn_trainer.load_model(model_path)
-        print("[OK] BNN模型加载完成")
-    else:
-        if force_retrain:
-            print("强制重新训练BNN模型...")
+        # 检查是否已有训练好的模型
+        if not force_retrain and os.path.exists(model_path):
+            print(f"发现已有的{customer_type} BNN模型，正在加载...")
+            bnn_trainer = BNNTrainer(
+                input_dim=X.shape[1],
+                hidden_dims=BNN_CONFIG['hidden_dims'],
+                learning_rate=BNN_CONFIG['learning_rate'],
+                weight_decay=BNN_CONFIG['weight_decay'],
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+            bnn_trainer.load_model(model_path)
+            print(f"[OK] {customer_type} BNN模型加载完成")
         else:
-            print("正在训练BNN模型...")
-        bnn_trainer = BNNTrainer(
-            input_dim=X.shape[1],
-            hidden_dims=BNN_CONFIG['hidden_dims'],  # 使用配置文件中的网络结构
-            learning_rate=BNN_CONFIG['learning_rate'],  # 使用配置文件中的学习率
-            weight_decay=BNN_CONFIG['weight_decay'],   # 使用配置文件中的权重衰减
-            device='cuda' if torch.cuda.is_available() else 'cpu'
+            if force_retrain:
+                print(f"强制重新训练{customer_type} BNN模型...")
+            else:
+                print(f"正在训练{customer_type} BNN模型...")
+            bnn_trainer = BNNTrainer(
+                input_dim=X.shape[1],
+                hidden_dims=BNN_CONFIG['hidden_dims'],
+                learning_rate=BNN_CONFIG['learning_rate'],
+                weight_decay=BNN_CONFIG['weight_decay'],
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+            
+            bnn_trainer.train(
+                X_train, y_train, X_val, y_val,
+                epochs=BNN_CONFIG['epochs'], batch_size=BNN_CONFIG['batch_size'],
+                save_path=model_path
+            )
+            print(f"[OK] {customer_type} BNN模型训练完成")
+        
+        # 测试模型性能（使用标准化数据评估）
+        print(f"正在评估{customer_type} BNN模型性能...")
+        mean_pred, var_pred = bnn_trainer.predict(X_test[:100])
+        
+        # 反标准化预测结果用于显示
+        mean_pred_original = demand_scaler.inverse_transform(mean_pred.reshape(-1, 1)).flatten()
+        y_test_original = demand_scaler.inverse_transform(y_test[:100].reshape(-1, 1)).flatten()
+        
+        mae = np.mean(np.abs(mean_pred.flatten() - y_test[:100]))
+        mae_original = np.mean(np.abs(mean_pred_original - y_test_original))
+        
+        print(f"{customer_type}测试集MAE（标准化空间）: {mae:.4f}")
+        print(f"{customer_type}测试集MAE（原始空间）: {mae_original:.2f}")
+        print(f"{customer_type}预测范围（标准化）: {mean_pred.min():.3f} - {mean_pred.max():.3f}")
+        print(f"{customer_type}真实范围（标准化）: {y_test[:100].min():.3f} - {y_test[:100].max():.3f}")
+        
+        # 置信区间覆盖率检验
+        print(f"\n正在计算{customer_type} 95%置信区间覆盖率...")
+        coverage_rate, in_interval = evaluate_confidence_interval_coverage(
+            mean_pred.flatten(), var_pred.flatten(), y_test[:100]
+        )
+        print(f"{customer_type} 95%置信区间覆盖率: {coverage_rate:.1f}%")
+        print(f"{customer_type}样本总数: {len(y_test[:100])}, 落在区间内: {np.sum(in_interval)}")
+        
+        # 绘制置信区间覆盖图
+        plot_confidence_interval_coverage(
+            y_test[:100], mean_pred.flatten(), var_pred.flatten(), 
+            in_interval, coverage_rate, save_path=f"../05_分析报告/confidence_interval_coverage_{customer_type}.png"
         )
         
-        bnn_trainer.train(
-            X_train, y_train, X_val, y_val,
-            epochs=BNN_CONFIG['epochs'], batch_size=BNN_CONFIG['batch_size'],  
-            save_path=model_path
-        )
-        print("[OK] BNN模型训练完成")
+        return bnn_trainer, demand_scaler
     
-    # 测试模型性能（使用标准化数据评估）
-    print("正在评估BNN模型性能...")
-    mean_pred, var_pred = bnn_trainer.predict(X_test[:100])
+    # 分别为线上和线下用户训练BNN模型
+    online_trainer, online_scaler = train_single_bnn_model(online_features_df, online_model_path, "线上用户")
+    offline_trainer, offline_scaler = train_single_bnn_model(offline_features_df, offline_model_path, "线下用户")
     
-    # 反标准化预测结果用于显示
-    mean_pred_original = demand_scaler.inverse_transform(mean_pred.reshape(-1, 1)).flatten()
-    y_test_original = demand_scaler.inverse_transform(y_test[:100].reshape(-1, 1)).flatten()
-    
-    mae = np.mean(np.abs(mean_pred.flatten() - y_test[:100]))
-    mae_original = np.mean(np.abs(mean_pred_original - y_test_original))
-    
-    print(f"测试集MAE（标准化空间）: {mae:.4f}")
-    print(f"测试集MAE（原始空间）: {mae_original:.2f}")
-    print(f"预测范围（标准化）: {mean_pred.min():.3f} - {mean_pred.max():.3f}")
-    print(f"真实范围（标准化）: {y_test[:100].min():.3f} - {y_test[:100].max():.3f}")
-    
-    # 置信区间覆盖率检验
-    print("\n正在计算95%置信区间覆盖率...")
-    coverage_rate, in_interval = evaluate_confidence_interval_coverage(
-        mean_pred.flatten(), var_pred.flatten(), y_test[:100]
-    )
-    print(f"95%置信区间覆盖率: {coverage_rate:.1f}%")
-    print(f"样本总数: {len(y_test[:100])}, 落在区间内: {np.sum(in_interval)}")
-    
-    # 绘制置信区间覆盖图
-    plot_confidence_interval_coverage(
-        y_test[:100], mean_pred.flatten(), var_pred.flatten(), 
-        in_interval, coverage_rate, save_path="../05_分析报告/confidence_interval_coverage.png"
-    )
-    
-    return bnn_trainer, demand_scaler
+    return online_trainer, offline_trainer, online_scaler, offline_scaler
 
-def train_rl_system(bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor, features_df: pd.DataFrame, demand_scaler: Optional[StandardScaler] = None) -> Tuple[HotelRLSystem, Optional[Dict], Optional[Dict]]:
+def train_rl_system(online_bnn_trainer: BNNTrainer, offline_bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor, online_features_df: pd.DataFrame, offline_features_df: pd.DataFrame, online_demand_scaler: Optional[StandardScaler] = None, offline_demand_scaler: Optional[StandardScaler] = None) -> Tuple[HotelRLSystem, Optional[Dict], Optional[Dict]]:
     """
-    训练强化学习系统
+    训练强化学习系统（支持线上和线下用户分别预测）
     
     构建并训练酒店定价强化学习系统，包括离线预训练和在线学习两个阶段。
-    使用Q-learning算法优化定价策略，结合BNN预测进行决策。
+    使用Q-learning算法优化定价策略，结合两个BNN预测器（线上和线下）进行决策。
     
     Args:
-        bnn_trainer: BNN训练器对象，用于需求预测
+        online_bnn_trainer: 线上用户BNN训练器对象
+        offline_bnn_trainer: 线下用户BNN训练器对象
         preprocessor: 数据预处理器对象，包含特征工程方法
-        features_df: 特征数据DataFrame，包含历史数据用于训练
-        demand_scaler: 需求标准化器，用于数据标准化处理
+        online_features_df: 线上用户特征数据DataFrame
+        offline_features_df: 线下用户特征数据DataFrame
+        online_demand_scaler: 线上用户需求标准化器
+        offline_demand_scaler: 线下用户需求标准化器
         
     Returns:
         Tuple[HotelRLSystem, Optional[Dict], Optional[Dict]]: (RL系统, 在线学习统计, 策略评估统计)
@@ -461,25 +486,29 @@ def train_rl_system(bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor
     5. 策略评估：评估学习后的策略性能（已关闭）
     
     Note:
+        - 使用两个独立的BNN预测器分别预测线上和线下用户需求
+        - 总需求预测为两个预测器结果相加
         - 使用ε-贪心策略进行探索和利用平衡
         - 支持离线预训练和在线学习两个阶段
         - 提供详细的Q值统计和探索覆盖率分析
         - 策略评估功能默认关闭以提高训练效率
     """
     
-    # 创建RL系统，使用配置文件中的探索参数
+    # 创建RL系统，使用两个BNN预测器
     rl_system = HotelRLSystem(
-        bnn_trainer, 
+        online_bnn_trainer, 
+        offline_bnn_trainer,
         preprocessor, 
-        demand_scaler,
+        online_demand_scaler,
+        offline_demand_scaler,
         epsilon_start=RL_CONFIG['epsilon_start'],
         epsilon_end=RL_CONFIG['epsilon_end'],
         epsilon_decay_episodes=RL_CONFIG['epsilon_decay_episodes']
     )
     
-    # 训练强化学习系统
+    # 训练强化学习系统（使用线上用户数据作为主要训练数据）
     print("开始离线预训练...")
-    rl_system.offline_pretraining(features_df, episodes=RL_CONFIG['episodes'])
+    rl_system.offline_pretraining(online_features_df, episodes=RL_CONFIG['episodes'])
     
     # 显示预训练后的探索统计
     print(f"\n=== 预训练完成后的探索统计 ===")
@@ -499,7 +528,7 @@ def train_rl_system(bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor
     # 在线学习（根据配置开关决定是否执行）
     if RL_CONFIG['enable_online_learning']:
         print("\n开始在线学习...")
-        online_stats = rl_system.online_learning(features_df, days=RL_CONFIG['online_learning_days'], update_frequency=RL_CONFIG['update_frequency'])
+        online_stats = rl_system.online_learning(online_features_df, days=RL_CONFIG['online_learning_days'], update_frequency=RL_CONFIG['update_frequency'])
         
         # 显示在线学习后的探索统计
         print(f"\n=== 在线学习完成后的探索统计 ===")
@@ -693,39 +722,51 @@ def main() -> None:
         return
     
     # 数据预处理
-    preprocessor, features_df = load_and_preprocess_data(args.data, force_reprocess=args.force_retrain)
+    preprocessor, online_features_df, offline_features_df = load_and_preprocess_data(args.data, force_reprocess=args.force_retrain)
     
     if not args.skip_training:
-        # 训练BNN模型
-        bnn_trainer, demand_scaler = train_bnn_model(preprocessor, features_df, force_retrain=args.force_retrain)
+        # 分别为线上和线下用户训练BNN模型
+        online_bnn_trainer, offline_bnn_trainer, online_demand_scaler, offline_demand_scaler = train_bnn_models(preprocessor, online_features_df, offline_features_df, force_retrain=args.force_retrain)
         
-        # 训练强化学习系统（传入demand_scaler）
-        rl_system, online_stats, avg_stats = train_rl_system(bnn_trainer, preprocessor, features_df, demand_scaler)
+        # 训练强化学习系统（传入两个BNN训练器）
+        rl_system, online_stats, avg_stats = train_rl_system(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_features_df, offline_features_df, online_demand_scaler, offline_demand_scaler)
     else:
         # 加载已有模型
         print("\n正在加载已有模型...")
         
-        # 加载BNN模型
-        bnn_model_path = '../02_训练模型/bnn_model_final.pth'
-        if not os.path.exists(bnn_model_path):
-            print("错误：未找到BNN模型文件，请先训练模型或移除--skip-training参数")
+        # 加载线上和线下BNN模型
+        online_bnn_model_path = '../02_训练模型/bnn_model_online.pth'
+        offline_bnn_model_path = '../02_训练模型/bnn_model_offline.pth'
+        if not os.path.exists(online_bnn_model_path) or not os.path.exists(offline_bnn_model_path):
+            print("错误：未找到线上或线下BNN模型文件，请先训练模型或移除--skip-training参数")
             return
         
-        # 重新创建BNN训练器并加载模型
-        bnn_trainer = BNNTrainer(
+        # 重新创建线上BNN训练器并加载模型
+        online_bnn_trainer = BNNTrainer(
             input_dim=BNN_CONFIG['input_dim'],  # 使用配置文件中的输入维度
             hidden_dims=BNN_CONFIG['hidden_dims'],  # 使用配置文件中的网络结构
             learning_rate=BNN_CONFIG['learning_rate'],  # 使用配置文件中的学习率
             weight_decay=BNN_CONFIG['weight_decay'],   # 使用配置文件中的权重衰减
             device='cuda' if torch.cuda.is_available() else 'cpu'
         )
-        bnn_trainer.load_model(bnn_model_path)
+        online_bnn_trainer.load_model(online_bnn_model_path)
         
-        # 加载demand_scaler用于跳过训练模式
-        demand_scaler = joblib.load('../02_训练模型/demand_scaler_main.pkl')
+        # 重新创建线下BNN训练器并加载模型
+        offline_bnn_trainer = BNNTrainer(
+            input_dim=BNN_CONFIG['input_dim'],  # 使用配置文件中的输入维度
+            hidden_dims=BNN_CONFIG['hidden_dims'],  # 使用配置文件中的网络结构
+            learning_rate=BNN_CONFIG['learning_rate'],  # 使用配置文件中的学习率
+            weight_decay=BNN_CONFIG['weight_decay'],   # 使用配置文件中的权重衰减
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        offline_bnn_trainer.load_model(offline_bnn_model_path)
         
-        # 创建RL系统
-        rl_system = HotelRLSystem(bnn_trainer, preprocessor, demand_scaler)
+        # 加载线上和线下demand_scaler用于跳过训练模式
+        online_demand_scaler = joblib.load('../02_训练模型/demand_scaler_online.pkl')
+        offline_demand_scaler = joblib.load('../02_训练模型/demand_scaler_offline.pkl')
+        
+        # 创建RL系统，使用两个BNN预测器
+        rl_system = HotelRLSystem(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_demand_scaler, offline_demand_scaler)
         
         # 加载训练好的智能体
         agent_path = '../02_训练模型/q_agent_final.pkl'
