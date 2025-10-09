@@ -37,6 +37,16 @@ cd 01_核心代码
 python main.py --force-retrain
 ```
 
+#### 贝叶斯Q-learning模式
+```bash
+cd 01_核心代码
+# 仅运行贝叶斯Q-learning算法
+python main.py --use-bayesian-rl
+# 从头开始训练(含BNN+BQL)
+python main.py --use-bayesian-rl --force-retrain
+```
+
+
 ## 📁 项目结构
 
 ```
@@ -67,7 +77,9 @@ python main.py [选项]
 选项:
   --skip-training          跳过训练，使用已有模型
   --force-retrain          强制重新训练所有模型
+  --use-bayesian-rl        使用贝叶斯Q-learning算法（默认使用标准Q-learning）
   --help                   显示帮助信息
 ```
 
 **注:**  ```rl_system.py``` 中的在线学习,策略评估没有开启使用,为占位函数
+
