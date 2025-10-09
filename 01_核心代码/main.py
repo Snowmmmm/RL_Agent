@@ -30,7 +30,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_preprocessing import HotelDataPreprocessor
 from bnn_model import BNNTrainer
 from rl_system import HotelRLSystem, QLearningAgent, HotelEnvironment
-from config import RL_CONFIG, BNN_CONFIG, SIMULATION_CONFIG
+from config import RL_CONFIG, BNN_CONFIG, SIMULATION_CONFIG, BQL_CONFIG
 
 # 配置警告过滤器
 warnings.filterwarnings('ignore')
@@ -117,7 +117,7 @@ def evaluate_confidence_interval_coverage(mean_pred: np.ndarray, var_pred: np.nd
     
     # 检查真实值是否在置信区间内
     in_interval = (y_true >= lower_bound) & (y_true <= upper_bound)
-    coverage_rate = np.mean(in_interval) * 100
+    coverage_rate = float(np.mean(in_interval)) * 100
     
     return coverage_rate, in_interval
 
@@ -225,10 +225,14 @@ def plot_confidence_interval_coverage(y_true: np.ndarray, mean_pred: np.ndarray,
     
     # 计算并打印残差统计信息
     print(f"\n=== 残差统计 ===")
-    print(f"残差均值: {np.mean(residuals):.4f}")
-    print(f"残差标准差: {np.std(residuals):.4f}")
-    print(f"标准化残差均值: {np.mean(standardized_residuals):.4f}")
-    print(f"标准化残差标准差: {np.std(standardized_residuals):.4f}")
+    residuals_mean: float = float(np.mean(residuals))
+    residuals_std: float = float(np.std(residuals))
+    standardized_mean: float = float(np.mean(standardized_residuals))
+    standardized_std: float = float(np.std(standardized_residuals))
+    print(f"残差均值: {residuals_mean:.4f}")
+    print(f"残差标准差: {residuals_std:.4f}")
+    print(f"标准化残差均值: {standardized_mean:.4f}")
+    print(f"标准化残差标准差: {standardized_std:.4f}")
 
 def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> Tuple[HotelDataPreprocessor, pd.DataFrame, pd.DataFrame]:
     """
@@ -459,7 +463,7 @@ def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd
     
     return online_trainer, offline_trainer, online_scaler, offline_scaler
 
-def train_rl_system(online_bnn_trainer: BNNTrainer, offline_bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor, online_features_df: pd.DataFrame, offline_features_df: pd.DataFrame, online_demand_scaler: Optional[StandardScaler] = None, offline_demand_scaler: Optional[StandardScaler] = None) -> Tuple[HotelRLSystem, Optional[Dict], Optional[Dict]]:
+def train_rl_system(online_bnn_trainer: BNNTrainer, offline_bnn_trainer: BNNTrainer, preprocessor: HotelDataPreprocessor, online_features_df: pd.DataFrame, offline_features_df: pd.DataFrame, online_demand_scaler: Optional[StandardScaler] = None, offline_demand_scaler: Optional[StandardScaler] = None, use_bayesian_rl: bool = False) -> Tuple[HotelRLSystem, Optional[Dict], Optional[Dict]]:
     """
     训练强化学习系统（支持线上和线下用户分别预测）
     
@@ -503,12 +507,13 @@ def train_rl_system(online_bnn_trainer: BNNTrainer, offline_bnn_trainer: BNNTrai
         offline_demand_scaler,
         epsilon_start=RL_CONFIG['epsilon_start'],
         epsilon_end=RL_CONFIG['epsilon_end'],
-        epsilon_decay_episodes=RL_CONFIG['epsilon_decay_episodes']
+        epsilon_decay_episodes=RL_CONFIG['epsilon_decay_episodes'],
+        use_bayesian_rl=use_bayesian_rl
     )
     
     # 训练强化学习系统（使用线上用户数据作为主要训练数据）
     print("开始离线预训练...")
-    rl_system.offline_pretraining(online_features_df, episodes=RL_CONFIG['episodes'])
+    rl_system.offline_pretraining(online_features_df, episodes=BQL_CONFIG['episodes'])
     
     # 显示预训练后的探索统计
     print(f"\n=== 预训练完成后的探索统计 ===")
@@ -706,6 +711,8 @@ def main() -> None:
                        help='跳过训练，直接使用已有模型')
     parser.add_argument('--force-retrain', action='store_true',
                        help='强制重新训练所有模型（忽略已有模型）')
+    parser.add_argument('--use-bayesian-rl', action='store_true',
+                       help='使用贝叶斯Q-learning算法（默认使用标准Q-learning）')
     # parser.add_argument('--simulate-days', type=int, default=90,
     #                    help='模拟天数')
     # parser.add_argument('--start-date', type=str, default='2017-01-01',
@@ -714,7 +721,8 @@ def main() -> None:
     args = parser.parse_args()
     
     print("=" * 60)
-    print("酒店动态定价系统 (BNN + Q-learning)")
+    algorithm = "贝叶斯Q-learning" if args.use_bayesian_rl else "Q-learning"
+    print(f"酒店动态定价系统 (BNN + {algorithm})")
     print("=" * 60)
     
     # 检查环境
@@ -729,7 +737,7 @@ def main() -> None:
         online_bnn_trainer, offline_bnn_trainer, online_demand_scaler, offline_demand_scaler = train_bnn_models(preprocessor, online_features_df, offline_features_df, force_retrain=args.force_retrain)
         
         # 训练强化学习系统（传入两个BNN训练器）
-        rl_system, online_stats, avg_stats = train_rl_system(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_features_df, offline_features_df, online_demand_scaler, offline_demand_scaler)
+        rl_system, online_stats, avg_stats = train_rl_system(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_features_df, offline_features_df, online_demand_scaler, offline_demand_scaler, use_bayesian_rl=args.use_bayesian_rl)
     else:
         # 加载已有模型
         print("\n正在加载已有模型...")
@@ -762,11 +770,11 @@ def main() -> None:
         offline_bnn_trainer.load_model(offline_bnn_model_path)
         
         # 加载线上和线下demand_scaler用于跳过训练模式
-        online_demand_scaler = joblib.load('../02_训练模型/demand_scaler_online.pkl')
-        offline_demand_scaler = joblib.load('../02_训练模型/demand_scaler_offline.pkl')
+        online_demand_scaler = joblib.load('../02_训练模型/demand_scaler_线上用户.pkl')
+        offline_demand_scaler = joblib.load('../02_训练模型/demand_scaler_线下用户.pkl')
         
         # 创建RL系统，使用两个BNN预测器
-        rl_system = HotelRLSystem(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_demand_scaler, offline_demand_scaler)
+        rl_system = HotelRLSystem(online_bnn_trainer, offline_bnn_trainer, preprocessor, online_demand_scaler, offline_demand_scaler, use_bayesian_rl=args.use_bayesian_rl)
         
         # 加载训练好的智能体
         agent_path = '../02_训练模型/q_agent_final.pkl'
@@ -789,86 +797,184 @@ def main() -> None:
     # print(f"\n模拟结果已保存到：{results_path}")
     
     # 输出Q表信息
-    print(f"\n=== Q表信息 ===")
-    if hasattr(rl_system, 'agent') and hasattr(rl_system.agent, 'q_table'):
-        q_table = rl_system.agent.q_table
-        print(f"Q表状态数量: {len(q_table)}")
-        
+    print(f"\n=== {'贝叶斯' if args.use_bayesian_rl else ''}Q表信息 ===")
+    if hasattr(rl_system, 'agent'):
         # 获取Q值统计
         q_stats = rl_system.agent.get_q_value_stats()
         if q_stats:
-            print(f"Q值统计:")
+            print(f"{'贝叶斯' if args.use_bayesian_rl else ''}Q值统计:")
             print(f"  平均Q值: {q_stats['mean_q_value']:.2f}")
-            print(f"  Q值标准差: {q_stats['std_q_value']:.2f}")
-            print(f"  最小Q값: {q_stats['min_q_value']:.2f}")
-            print(f"  最大Q값: {q_stats['max_q_value']:.2f}")
+            if args.use_bayesian_rl:
+                if 'mean_uncertainty' in q_stats:
+                    print(f"  平均不确定性: {q_stats['mean_uncertainty']:.2f}")
+                if 'std_uncertainty' in q_stats:
+                    print(f"  不确定性标准差: {q_stats['std_uncertainty']:.2f}")
+                if 'min_uncertainty' in q_stats:
+                    print(f"  最小不确定性: {q_stats['min_uncertainty']:.2f}")
+                if 'max_uncertainty' in q_stats:
+                    print(f"  最大不确定性: {q_stats['max_uncertainty']:.2f}")
+            else:
+                print(f"  Q值标准差: {q_stats['std_q_value']:.2f}")
+                print(f"  最小Q值: {q_stats['min_q_value']:.2f}")
+                print(f"  最大Q值: {q_stats['max_q_value']:.2f}")
             print(f"  总状态访问次数: {q_stats['num_state_visits']}")
-            print(f"  零值Q값占比: {q_stats['zero_q_percentage']:.1f}%")
+            print(f"  零值Q值占比: {q_stats['zero_q_percentage']:.1f}%")
             print(f"  探索覆盖率: {q_stats['exploration_coverage']:.1f}%")
             print(f"  已探索状态-动作对: {q_stats['explored_state_actions']}/{q_stats['total_state_actions']}")
         
-        # 显示前10个状态的Q值
-        print(f"\n前10个状态的Q值:")
-        prices = [60, 90, 120, 150, 180, 210]
-        for i, (state, q_values) in enumerate(list(q_table.items())[:10]):
-            best_action = np.argmax(q_values)
-            print(f"状态 {state}: {[f'{q:.1f}' for q in q_values]} -> 最佳动作: {best_action} (价格: {prices[best_action]}元)")
-        
-        if len(q_table) > 10:
-            print(f"... 还有 {len(q_table) - 10} 个状态")
+        # 显示Q表内容（标准Q-learning）或Q值分布（贝叶斯Q-learning）
+        if rl_system.is_standard_ql_agent():
+            # 标准Q-learning
+            q_table = rl_system.agent.q_table
+            print(f"\nQ表状态数量: {len(q_table)}")
+            
+            # 显示前10个状态的Q值
+            print(f"\n前10个状态的Q值:")
+            prices = [60, 90, 120, 150, 180, 210]
+            for i, (state, q_values) in enumerate(list(q_table.items())[:10]):
+                best_action = np.argmax(q_values)
+                print(f"状态 {state}: {[f'{q:.1f}' for q in q_values]} -> 最佳动作: {best_action} (价格: {prices[best_action]}元)")
+            
+            if len(q_table) > 10:
+                print(f"... 还有 {len(q_table) - 10} 个状态")
+        elif rl_system.is_bayesian_ql_agent():
+            # 贝叶斯Q-learning
+            q_means = rl_system.agent.q_means
+            q_vars = rl_system.agent.q_vars
+            print(f"\nQ值分布数量: {len(q_means)}")
+            
+            # 显示前10个状态的Q值分布
+            print(f"\n前10个状态的Q值分布（均值±标准差）:")
+            prices = [60, 90, 120, 150, 180, 210]
+            for i, (state, means) in enumerate(list(q_means.items())[:10]):
+                variances = q_vars[state]
+                uncertainties = np.sqrt(variances)
+                best_action = np.argmax(means)
+                q_distributions = [f'{m:.1f}±{u:.1f}' for m, u in zip(means, uncertainties)]
+                print(f"状态 {state}: {q_distributions} -> 最佳动作: {best_action} (价格: {prices[best_action]}元)")
+            
+            if len(q_means) > 10:
+                print(f"... 还有 {len(q_means) - 10} 个状态")
         
         # 保存Q表到CSV文件
         try:
+            # 生成时间戳
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # 创建Q表DataFrame
+            # 根据算法类型获取Q值数据
             q_table_data = []
             prices = [60, 90, 120, 150, 180, 210]
             
-            for state, q_values in q_table.items():
-                best_action = np.argmax(q_values)
-                row = {
-                    'state': state,
-                    'action_0': q_values[0],
-                    'action_1': q_values[1], 
-                    'action_2': q_values[2],
-                    'action_3': q_values[3],
-                    'action_4': q_values[4],
-                    'action_5': q_values[5],
-                    'best_action': best_action,
-                    'best_price': prices[best_action],
-                    'best_value': q_values[best_action]
-                }
-                q_table_data.append(row)
+            if rl_system.is_standard_ql_agent():
+                # 标准Q-learning
+                q_data = rl_system.agent.q_table
+                for state, q_values in q_data.items():
+                    best_action = np.argmax(q_values)
+                    row = {
+                        'state': state,
+                        'action_0': q_values[0],
+                        'action_1': q_values[1], 
+                        'action_2': q_values[2],
+                        'action_3': q_values[3],
+                        'action_4': q_values[4],
+                        'action_5': q_values[5],
+                        'best_action': best_action,
+                        'best_price': prices[best_action],
+                        'best_value': q_values[best_action]
+                    }
+                    q_table_data.append(row)
+                    
+            elif rl_system.is_bayesian_ql_agent():
+                # 贝叶斯Q-learning
+                q_means = rl_system.agent.q_means
+                q_vars = rl_system.agent.q_vars
+                for state, means in q_means.items():
+                    variances = q_vars[state]
+                    best_action = np.argmax(means)
+                    row = {
+                        'state': state,
+                        'action_0': means[0],
+                        'action_1': means[1], 
+                        'action_2': means[2],
+                        'action_3': means[3],
+                        'action_4': means[4],
+                        'action_5': means[5],
+                        'best_action': best_action,
+                        'best_price': prices[best_action],
+                        'best_value': means[best_action],
+                        'variance_0': variances[0],
+                        'variance_1': variances[1],
+                        'variance_2': variances[2],
+                        'variance_3': variances[3],
+                        'variance_4': variances[4],
+                        'variance_5': variances[5],
+                        'uncertainty_0': np.sqrt(variances[0]),
+                        'uncertainty_1': np.sqrt(variances[1]),
+                        'uncertainty_2': np.sqrt(variances[2]),
+                        'uncertainty_3': np.sqrt(variances[3]),
+                        'uncertainty_4': np.sqrt(variances[4]),
+                        'uncertainty_5': np.sqrt(variances[5]),
+                        'best_uncertainty': np.sqrt(variances[best_action]),
+                        # 新增(μ, σ²)格式列
+                        'action_0_mu_sigma': f'({means[0]:.0f}, {variances[0]:.1f})',
+                        'action_1_mu_sigma': f'({means[1]:.0f}, {variances[1]:.1f})',
+                        'action_2_mu_sigma': f'({means[2]:.0f}, {variances[2]:.1f})',
+                        'action_3_mu_sigma': f'({means[3]:.0f}, {variances[3]:.1f})',
+                        'action_4_mu_sigma': f'({means[4]:.0f}, {variances[4]:.1f})',
+                        'action_5_mu_sigma': f'({means[5]:.0f}, {variances[5]:.1f})',
+                        'best_mu_sigma': f'({means[best_action]:.0f}, {variances[best_action]:.1f})'
+                    }
+                    q_table_data.append(row)
             
-            q_table_df = pd.DataFrame(q_table_data)
-            
-            # 生成CSV文件名（包含时间戳）
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            q_table_csv_path = f'../05_分析报告/q_table_main_{timestamp}.csv'
-            
-            # 保存到CSV
-            q_table_df.to_csv(q_table_csv_path, index=False)
-            print(f"\nQ表已保存到CSV文件: {q_table_csv_path}")
-            
-            # 同时保存Q表统计信息
-            if q_stats:
-                stats_df = pd.DataFrame([{
-                    'total_states': len(q_table),
-                    'mean_q_value': q_stats['mean_q_value'],
-                    'std_q_value': q_stats['std_q_value'],
-                    'min_q_value': q_stats['min_q_value'],
-                    'max_q_value': q_stats['max_q_value'],
-                    'total_visits': q_stats['num_state_visits'],
-                    'zero_q_percentage': q_stats['zero_q_percentage'],
-                    'exploration_coverage': q_stats['exploration_coverage'],
-                    'explored_state_actions': q_stats['explored_state_actions'],
-                    'total_state_actions': q_stats['total_state_actions']
-                }])
+            if q_table_data:
+                q_table_df = pd.DataFrame(q_table_data)
                 
-                stats_csv_path = f'../05_分析报告/q_table_stats_{timestamp}.csv'
-                stats_df.to_csv(stats_csv_path, index=False)
-                print(f"Q表统计信息已保存到: {stats_csv_path}")
+                # 保存到CSV
+                q_table_csv_path = f'../05_分析报告/q_table_main_{timestamp}.csv'
+                q_table_df.to_csv(q_table_csv_path, index=False)
+                print(f"\nQ表已保存到CSV文件: {q_table_csv_path}")
                 
+                # 同时保存Q表统计信息
+                if q_stats:
+                    stats_data = {
+                        'total_states': len(q_table_data),
+                        'mean_q_value': q_stats['mean_q_value'],
+                        'total_visits': q_stats['num_state_visits'],
+                        'zero_q_percentage': q_stats['zero_q_percentage'],
+                        'exploration_coverage': q_stats['exploration_coverage'],
+                        'explored_state_actions': q_stats['explored_state_actions'],
+                        'total_state_actions': q_stats['total_state_actions']
+                    }
+                    
+                    # 根据算法类型添加相应的统计信息
+                    if args.use_bayesian_rl:
+                        # 贝叶斯Q-learning的统计信息
+                        if 'mean_uncertainty' in q_stats:
+                            stats_data['mean_uncertainty'] = q_stats['mean_uncertainty']
+                            stats_data['std_uncertainty'] = q_stats['std_uncertainty']
+                            stats_data['min_uncertainty'] = q_stats['min_uncertainty']
+                            stats_data['max_uncertainty'] = q_stats['max_uncertainty']
+                        stats_data['algorithm'] = 'Bayesian Q-Learning'
+                        stats_data['observation_noise_var'] = BQL_CONFIG['observation_noise_var']
+                        stats_data['prior_mean'] = BQL_CONFIG['prior_mean']
+                        stats_data['prior_var'] = BQL_CONFIG['prior_var']
+                        stats_data['exploration_strategy'] = BQL_CONFIG['exploration_strategy']
+                    else:
+                        # 标准Q-learning的统计信息
+                        if 'std_q_value' in q_stats:
+                            stats_data['std_q_value'] = q_stats['std_q_value']
+                        if 'min_q_value' in q_stats:
+                            stats_data['min_q_value'] = q_stats['min_q_value']
+                        if 'max_q_value' in q_stats:
+                            stats_data['max_q_value'] = q_stats['max_q_value']
+                        stats_data['algorithm'] = 'Standard Q-Learning'
+                    
+                    stats_df = pd.DataFrame([stats_data])
+                    
+                    stats_csv_path = f'../05_分析报告/q_table_stats_{timestamp}.csv'
+                    stats_df.to_csv(stats_csv_path, index=False)
+                    print(f"Q表统计信息已保存到: {stats_csv_path}")
+            
         except Exception as e:
             print(f"保存Q表到CSV时出错: {e}")
         
@@ -882,14 +988,32 @@ def main() -> None:
             plt.rcParams['font.sans-serif'] = ['SimHei', 'WenQuanYi Micro Hei', 'Heiti TC', 'Arial Unicode MS', 'DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False
             
-            # 创建状态-动作矩阵
-            states = sorted(q_table.keys())
-            actions = list(range(6))
-            
-            # 创建Q值矩阵
-            q_matrix = np.zeros((len(states), len(actions)))
-            for i, state in enumerate(states):
-                q_matrix[i, :] = q_table[state]
+            # 根据算法类型获取Q值数据
+            if rl_system.is_standard_ql_agent():
+                # 标准Q-learning
+                q_data = rl_system.agent.q_table
+                states = sorted(q_data.keys())
+                actions = list(range(6))
+                
+                # 创建Q值矩阵
+                q_matrix = np.zeros((len(states), len(actions)))
+                for i, state in enumerate(states):
+                    q_matrix[i, :] = q_data[state]
+                    
+            elif rl_system.is_bayesian_ql_agent():
+                # 贝叶斯Q-learning - 使用Q值均值
+                q_means = rl_system.agent.q_means
+                q_vars = rl_system.agent.q_vars
+                states = sorted(q_means.keys())
+                actions = list(range(6))
+                
+                # 创建Q值矩阵（使用均值）
+                q_matrix = np.zeros((len(states), len(actions)))
+                for i, state in enumerate(states):
+                    q_matrix[i, :] = q_means[state]
+            else:
+                print("[警告] 无法获取Q值数据，跳过热力图绘制")
+                return
             
             # 创建状态标签（库存等级 + 季节 + 日期类型）
             state_labels = []
@@ -915,22 +1039,48 @@ def main() -> None:
             # 动作标签（价格）
             action_labels = ['¥60', '¥90', '¥120', '¥150', '¥180', '¥210']
             
-            # 创建热力图
+            # 创建Q值热力图
             fig, ax = plt.subplots(figsize=(14, 10))
             
-            # 使用seaborn绘制热力图
-            sns.heatmap(q_matrix, 
-                        xticklabels=action_labels, 
-                        yticklabels=state_labels,
-                        cmap='RdYlBu_r', 
-                        center=0,
-                        annot=True, 
-                        fmt='.1f',
-                        cbar_kws={'label': 'Q값'},
-                        ax=ax)
+            # 创建注释矩阵显示(μ, σ²)格式
+            if rl_system.is_bayesian_ql_agent():
+                # 贝叶斯Q-learning: 显示(μ, σ²)格式
+                annot_matrix = np.empty((len(states), len(actions)), dtype=object)
+                for i, state in enumerate(states):
+                    means = q_means[state]
+                    vars = q_vars[state]
+                    for j in range(len(actions)):
+                        annot_matrix[i, j] = f'({means[j]:.0f}, {vars[j]:.1f})'
+                
+                # 使用较小的字体以适应(μ, σ²)格式
+                sns.heatmap(q_matrix, 
+                            xticklabels=action_labels, 
+                            yticklabels=state_labels,
+                            cmap='RdYlBu_r', 
+                            center=0,
+                            annot=annot_matrix, 
+                            fmt='',
+                            annot_kws={'size': 8},
+                            cbar_kws={'label': 'Q值均值'},
+                            ax=ax)
+            else:
+                # 标准Q-learning: 保持原格式
+                sns.heatmap(q_matrix, 
+                            xticklabels=action_labels, 
+                            yticklabels=state_labels,
+                            cmap='RdYlBu_r', 
+                            center=0,
+                            annot=True, 
+                            fmt='.1f',
+                            cbar_kws={'label': 'Q值'},
+                            ax=ax)
             
             # 设置标题和标签
-            ax.set_title('Q表热力图 - 酒店动态定价策略', fontsize=16, fontweight='bold', pad=20)
+            algorithm_name = '贝叶斯' if rl_system.is_bayesian_ql_agent() else '标准'
+            if rl_system.is_bayesian_ql_agent():
+                ax.set_title(f'{algorithm_name}Q值热力图 (μ, σ²) - 酒店动态定价策略', fontsize=16, fontweight='bold', pad=20)
+            else:
+                ax.set_title(f'{algorithm_name}Q值热力图 - 酒店动态定价策略', fontsize=16, fontweight='bold', pad=20)
             ax.set_xlabel('定价动作（价格）', fontsize=12, fontweight='bold')
             ax.set_ylabel('状态（库存等级 + 季节 + 日期类型）', fontsize=12, fontweight='bold')
             
@@ -940,7 +1090,7 @@ def main() -> None:
             # 保存热力图
             heatmap_path = f'../04_结果输出/q_table_heatmap_{timestamp}.png'
             plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
-            print(f"[OK] Q表热力图已保存到: {heatmap_path}")
+            print(f"[OK] Q值热力图已保存到: {heatmap_path}")
             
             # 显示热力图
             plt.show()
@@ -951,7 +1101,10 @@ def main() -> None:
             # 创建最佳动作矩阵
             best_action_matrix = np.zeros((len(states), len(actions)))
             for i, state in enumerate(states):
-                best_action = np.argmax(q_table[state])
+                if rl_system.is_standard_ql_agent():
+                    best_action = np.argmax(q_data[state])
+                else:
+                    best_action = np.argmax(q_means[state])
                 best_action_matrix[i, best_action] = 1
             
             # 将矩阵转换为整数类型以避免格式化错误
@@ -973,7 +1126,8 @@ def main() -> None:
                         ax=ax2)
             
             # 设置标题和标签
-            ax2.set_title('最佳策略热力图 - 酒店动态定价', fontsize=16, fontweight='bold', pad=20)
+            algorithm_name = '贝叶斯' if rl_system.is_bayesian_ql_agent() else '标准'
+            ax2.set_title(f'{algorithm_name}最佳策略热力图 - 酒店动态定价', fontsize=16, fontweight='bold', pad=20)
             ax2.set_xlabel('定价动作（价格）', fontsize=12, fontweight='bold')
             ax2.set_ylabel('状态（库存等级 + 季节 + 日期类型）', fontsize=12, fontweight='bold')
             
@@ -988,10 +1142,85 @@ def main() -> None:
             # 显示最佳策略热力图
             plt.show()
             
-            print("[OK] Q表热力图绘制完成")
+            print("[OK] Q值热力图绘制完成")
+            
+            # 如果是贝叶斯Q-learning，绘制不确定性热力图
+            if rl_system.is_bayesian_ql_agent():
+                print("\n=== 绘制不确定性热力图 ===")
+                
+                # 创建不确定性矩阵
+                uncertainty_matrix = np.zeros((len(states), len(actions)))
+                for i, state in enumerate(states):
+                    variances = q_vars[state]
+                    uncertainty_matrix[i, :] = np.sqrt(variances)  # 标准差作为不确定性
+                
+                # 创建不确定性热力图
+                fig3, ax3 = plt.subplots(figsize=(14, 10))
+                
+                sns.heatmap(uncertainty_matrix, 
+                            xticklabels=action_labels, 
+                            yticklabels=state_labels,
+                            cmap='YlOrRd', 
+                            annot=True, 
+                            fmt='.2f',
+                            cbar_kws={'label': '不确定性（标准差）'},
+                            ax=ax3)
+                
+                # 设置标题和标签
+                ax3.set_title('Q值不确定性热力图 - 贝叶斯Q-learning', fontsize=16, fontweight='bold', pad=20)
+                ax3.set_xlabel('定价动作（价格）', fontsize=12, fontweight='bold')
+                ax3.set_ylabel('状态（库存等级 + 季节 + 日期类型）', fontsize=12, fontweight='bold')
+                
+                # 调整布局
+                plt.tight_layout()
+                
+                # 保存不确定性热力图
+                uncertainty_path = f'../04_结果输出/q_uncertainty_heatmap_{timestamp}.png'
+                plt.savefig(uncertainty_path, dpi=300, bbox_inches='tight')
+                print(f"[OK] Q值不确定性热力图已保存到: {uncertainty_path}")
+                
+                # 显示不确定性热力图
+                plt.show()
+                
+                # 创建精度热力图（方差的倒数）
+                print("\n=== 绘制精度热力图 ===")
+                
+                # 创建精度矩阵
+                precision_matrix = np.zeros((len(states), len(actions)))
+                for i, state in enumerate(states):
+                    variances = q_vars[state]
+                    precision_matrix[i, :] = 1.0 / (variances + 1e-8)  # 避免除零
+                
+                # 创建精度热力图
+                fig4, ax4 = plt.subplots(figsize=(14, 10))
+                
+                sns.heatmap(precision_matrix, 
+                            xticklabels=action_labels, 
+                            yticklabels=state_labels,
+                            cmap='YlGnBu', 
+                            annot=True, 
+                            fmt='.2f',
+                            cbar_kws={'label': '精度（1/方差）'},
+                            ax=ax4)
+                
+                # 设置标题和标签
+                ax4.set_title('Q值精度热力图 - 贝叶斯Q-learning', fontsize=16, fontweight='bold', pad=20)
+                ax4.set_xlabel('定价动作（价格）', fontsize=12, fontweight='bold')
+                ax4.set_ylabel('状态（库存等级 + 季节 + 日期类型）', fontsize=12, fontweight='bold')
+                
+                # 调整布局
+                plt.tight_layout()
+                
+                # 保存精度热力图
+                precision_path = f'../04_结果输出/q_precision_heatmap_{timestamp}.png'
+                plt.savefig(precision_path, dpi=300, bbox_inches='tight')
+                print(f"[OK] Q值精度热力图已保存到: {precision_path}")
+                
+                # 显示精度热力图
+                plt.show()
             
         except Exception as e:
-            print(f"绘制Q表热力图时出错: {e}")
+            print(f"绘制Q值热力图时出错: {e}")
             traceback.print_exc()
     
     # 策略评估功能已移除（模拟结果不可用）

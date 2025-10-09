@@ -109,7 +109,7 @@ RL_CONFIG = {
     'epsilon_min': 0.01,  # 最小探索率，保持少量探索
     
     # 训练配置
-    'episodes': 1000,  # 离线预训练轮数
+    'episodes': 10,  # 离线预训练轮数
     'online_learning_days': 90,  # 在线学习天数
     'update_frequency': 7,  # BNN模型更新频率（天）
     
@@ -160,7 +160,7 @@ ENV_CONFIG = {
     'min_inventory': 0,  # 最小库存（不能为负）
     
     # 定价策略
-    'price_levels': [60, 90, 120, 150, 180, 210, 240],  # 7个定价档位（元/晚）
+    'price_levels': [60, 90, 120, 150, 180, 210],  # 6个定价档位（元/晚）
     
     # 奖励函数权重
     'demand_weight': 0.7,  # 需求满足权重
@@ -181,6 +181,22 @@ SIMULATION_CONFIG = {
 }
 
 # =============================================================================
+# 系统配置
+# =============================================================================
+# 系统级配置参数，控制硬件使用和全局行为
+SYSTEM_CONFIG = {
+    'use_cuda': True,  # 是否使用CUDA GPU加速（如果可用）
+    'device': 'auto',  # 设备选择：'auto', 'cuda', 'cpu'
+    'random_seed': 42,  # 全局随机种子
+    'max_workers': 4,  # 最大工作进程数（用于并行处理）
+    'memory_limit_gb': 8,  # 内存使用限制（GB）
+    'enable_gpu_memory_growth': True,  # 是否启用GPU内存增长
+    'mixed_precision': False,  # 是否使用混合精度训练
+    'compile_models': False,  # 是否编译模型（PyTorch 2.0+）
+    'profile_performance': False  # 是否启用性能分析
+}
+
+# =============================================================================
 # 日志配置
 # =============================================================================
 # 系统日志和输出配置
@@ -192,27 +208,69 @@ LOG_CONFIG = {
 }
 
 # =============================================================================
-# 系统配置
+# 贝叶斯强化学习(BQL)配置
 # =============================================================================
-# 系统性能和资源管理配置
-SYSTEM_CONFIG = {
-    # 计算设备配置
-    'use_cuda': True,  # 是否使用GPU加速（如果可用）
-    'random_seed': 42,  # 随机种子，确保结果可重现
+# 贝叶斯Q-Learning算法参数，使用概率分布表示Q值信念
+BQL_CONFIG = {
+    # Q-learning核心参数
+    'discount_factor': 0.97,  # 提高以重视长期收益，适配库存管理
     
-    # 保存频率配置
-    'save_frequency': 10,  # 模型保存频率（轮数）
-    'checkpoint_frequency': 50,  # 检查点保存频率（轮数）
+    # 贝叶斯参数
+    'observation_noise_var': 1.2,  # 增大以兼容需求预测噪声
+    'prior_mean': 50.0,  # 基于实际净收益范围调整
+    'prior_var': 15.0,  # 增大以鼓励初始探索
+    
+    # 探索策略
+    'exploration_strategy': 'thompson',  # 适合挖掘高潜力定价策略
+    'ucb_c': 2.5,  # 增大以强化旺季探索
+    'ucb_bonus_scale': 2.0,  # 与ucb_c配合平衡均值与不确定性
+    'epsilon_start': 0.9,  
+    'epsilon_min': 0.1,  
+    
+    # 训练配置
+    'episodes': 10,  # 增加以覆盖完整季节规律
+    'online_learning_days': 90,  
+    
+    # 系统配置
+    'random_seed': 42,  
+    'save_frequency': 20,  # 减少保存频率
+    'checkpoint_frequency': 50,  
     
     # 资源限制
-    'max_memory_usage': 0.9,  # 最大内存使用率（90%），防止内存溢出
-    'max_cpu_cores': 0,  # 最大CPU核心数，0表示使用所有可用核心
+    'max_memory_usage': 0.9,  
+    'max_cpu_cores': 0,  
     
     # 性能优化
-    'enable_memory_optimization': True,  # 启用内存优化
-    'batch_data_loading': True,  # 启用批量数据加载
-    'parallel_processing': True  # 启用并行处理
+    'enable_memory_optimization': True,  
+    'batch_data_loading': True,  
+    'parallel_processing': True,  
+    
+    # 智能体模型保存路径（保持不变）
+    'agent_paths': {
+        'pretrained': os.path.join(PROJECT_ROOT, '02_训练模型', 'bql_agent_pretrained.pkl'),
+        'final': os.path.join(PROJECT_ROOT, '02_训练模型', 'bql_agent_final.pkl'),
+        'online': os.path.join(PROJECT_ROOT, '02_训练模型', 'bql_agent_online.pkl')
+    }
 }
+
+"""
+BQL配置说明：
+贝叶斯参数：
+- observation_noise_var: 观测噪声方差，控制TD目标的可信度
+- prior_mean/var: 先验分布参数，初始信念
+- 较小的观测噪声方差意味着更信任新观测
+
+探索策略：
+- ucb: 基于不确定性的上置信界探索
+- thompson: Thompson采样，从后验分布采样
+- epsilon_greedy: 标准的ε-贪心策略
+
+核心特性：
+- 维护Q值的概率分布而非点估计
+- 不确定性随经验增加而降低
+- 支持多种贝叶斯探索策略
+- 提供不确定性量化
+"""
 
 def get_device() -> torch.device:
     """
@@ -301,6 +359,7 @@ def validate_config() -> bool:
         - 提供配置修复建议
     """
     import os
+    import typing
     
     # 检查数据文件
     if not os.path.exists(DATA_CONFIG['data_path']):
@@ -308,33 +367,42 @@ def validate_config() -> bool:
         return False
     
     # 检查BNN配置
-    if BNN_CONFIG['input_dim'] <= 0:
+    input_dim = int(BNN_CONFIG['input_dim'])  # type: ignore
+    if input_dim <= 0:
         print("错误：BNN输入维度必须大于0")
         return False
     
-    if not BNN_CONFIG['hidden_dims']:
+    hidden_dims = typing.cast(typing.List[int], BNN_CONFIG['hidden_dims'])  # type: ignore
+    if not hidden_dims:
         print("错误：BNN隐藏层不能为空")
         return False
     
     # 检查RL配置
-    if RL_CONFIG['epsilon_start'] < 0 or RL_CONFIG['epsilon_start'] > 1:
+    epsilon_start = float(RL_CONFIG['epsilon_start'])  # type: ignore
+    epsilon_end = float(RL_CONFIG['epsilon_end'])  # type: ignore
+    discount_factor = float(RL_CONFIG['discount_factor'])  # type: ignore
+    
+    if epsilon_start < 0 or epsilon_start > 1:
         print("错误：epsilon_start必须在0和1之间")
         return False
     
-    if RL_CONFIG['epsilon_end'] < 0 or RL_CONFIG['epsilon_end'] > 1:
+    if epsilon_end < 0 or epsilon_end > 1:
         print("错误：epsilon_end必须在0和1之间")
         return False
     
-    if RL_CONFIG['discount_factor'] < 0 or RL_CONFIG['discount_factor'] > 1:
+    if discount_factor < 0 or discount_factor > 1:
         print("错误：折扣因子必须在0和1之间")
         return False
     
     # 检查环境配置
-    if ENV_CONFIG['initial_inventory'] <= 0:
+    initial_inventory = int(ENV_CONFIG['initial_inventory'])  # type: ignore
+    price_levels = typing.cast(typing.List[int], ENV_CONFIG['price_levels'])  # type: ignore
+    
+    if initial_inventory <= 0:
         print("错误：初始库存必须大于0")
         return False
     
-    if len(ENV_CONFIG['price_levels']) < 2:
+    if len(price_levels) < 2:
         print("错误：至少需要2个价格档位")
         return False
     

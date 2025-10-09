@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import warnings
 from training_monitor import get_training_monitor
 from typing import Optional, Dict, List, Any, Tuple, Union
+from scipy import stats  
+from config import BQL_CONFIG  
 warnings.filterwarnings('ignore')
 
 class HotelEnvironment:
@@ -614,8 +616,8 @@ class QLearningAgent:
         - 支持多阶段收益计算（当日收益+未来预期收益）
         """
         state_info = env.reset()
-        total_reward = 0
-        steps = 0
+        total_reward = 0.0  # 明确指定为float类型
+        steps: int = 0
         
         # 初始化每日记录列表
         daily_rewards = []
@@ -1011,17 +1013,33 @@ class HotelRLSystem:
     
     def __init__(self, online_bnn_trainer: Any, offline_bnn_trainer: Any, preprocessor: Any, 
                  online_demand_scaler: Optional[Any] = None, offline_demand_scaler: Optional[Any] = None,
-                 epsilon_start: float = 0.9, epsilon_end: float = 0.1, epsilon_decay_episodes: int = 400) -> None:
+                 epsilon_start: float = 0.9, epsilon_end: float = 0.1, epsilon_decay_episodes: int = 400,
+                 use_bayesian_rl: bool = False) -> None:
         self.online_bnn_trainer = online_bnn_trainer
         self.offline_bnn_trainer = offline_bnn_trainer
         self.preprocessor = preprocessor
         self.online_bnn_predictor = BNNPredictorWrapper(online_bnn_trainer, preprocessor, online_demand_scaler)
         self.offline_bnn_predictor = BNNPredictorWrapper(offline_bnn_trainer, preprocessor, offline_demand_scaler)
-        self.agent = QLearningAgent(
-            epsilon_start=epsilon_start,
-            epsilon_end=epsilon_end,
-            epsilon_decay_steps=epsilon_decay_episodes
-        )
+        
+        # 根据配置选择使用标准Q-learning还是贝叶斯Q-learning
+        if use_bayesian_rl:
+            print("使用贝叶斯Q-learning算法")
+            self.agent = BayesianQLearning(
+                n_states=30,  # 状态数：库存等级(5) × 季节(3) × 日期类型(2) = 30
+                n_actions=6,  # 动作数：6个价格档位
+                discount_factor=BQL_CONFIG['discount_factor'],
+                observation_noise_var=BQL_CONFIG['observation_noise_var'],
+                prior_mean=BQL_CONFIG['prior_mean'],
+                prior_var=BQL_CONFIG['prior_var']
+            )
+        else:
+            print("使用标准Q-learning算法")
+            self.agent = QLearningAgent(
+                epsilon_start=epsilon_start,
+                epsilon_end=epsilon_end,
+                epsilon_decay_steps=epsilon_decay_episodes
+            )
+        
         self.env = HotelEnvironment()
     
     def offline_pretraining(self, features_df: pd.DataFrame, episodes: int = 1000) -> None:
@@ -1366,6 +1384,521 @@ class HotelRLSystem:
             print(f"平均价格: {avg_stats['average_price']:.2f}")
         
         return avg_stats, all_stats
+
+class BayesianQLearning:
+    """
+    贝叶斯Q-Learning (BQL) 实现
+    
+    在BQL中，我们维护Q(s,a)的概率分布信念，假设Q值服从高斯分布：
+    Q(s,a) ~ N(μ_{s,a}, σ²_{s,a})
+    
+    更新过程使用贝叶斯推断，结合先验信念和观测证据来更新后验分布。
+    """
+    
+    def __init__(self, n_states: int = 30, n_actions: int = 6, discount_factor: float = 0.9,
+                 observation_noise_var: float = 1.0, prior_mean: float = 0.0, prior_var: float = 10.0,
+                 q_value_max: float = 1000.0, reward_scale: float = 0.1):
+        """
+        初始化贝叶斯Q-Learning
+        
+        Args:
+            n_states: 状态数量
+            n_actions: 动作数量  
+            discount_factor: 折扣因子γ
+            observation_noise_var: 观测噪声方差σ²_r
+            prior_mean: 先验均值
+            prior_var: 先验方差
+            q_value_max: Q值上限，防止极端值
+            reward_scale: 奖励缩放因子，用于归一化奖励范围
+        """
+        self.n_states = n_states
+        self.n_actions = n_actions
+        self.discount_factor = discount_factor
+        self.observation_noise_var = observation_noise_var
+        self.q_value_max = q_value_max
+        self.reward_scale = reward_scale
+        
+        # Q值分布参数：每个状态-动作对的均值和方差
+        # 使用字典存储，支持动态状态空间
+        self.q_means = defaultdict(lambda: np.full(n_actions, prior_mean))  # μ_{s,a}
+        self.q_vars = defaultdict(lambda: np.full(n_actions, prior_var))    # σ²_{s,a}
+        
+        # 状态访问计数
+        self.state_visit_count = defaultdict(int)
+        self.state_action_visit_count = defaultdict(int)
+        
+        # 训练历史
+        self.training_history = []
+        
+        # 异常值检测参数
+        self.q_value_history = defaultdict(list)  # 记录Q值历史用于异常检测
+        self.max_q_value_change = 5.0  # 最大允许的Q值变化倍数
+        self.min_variance = 0.1  # 最小方差，防止过度自信
+    
+    def get_state_distribution(self, state: Union[List, np.ndarray, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """获取状态的Q值分布（均值和方差）"""
+        state_key = tuple(state) if isinstance(state, (list, np.ndarray)) else state
+        return self.q_means[state_key].copy(), self.q_vars[state_key].copy()
+    
+    def select_action(self, state: Union[List, np.ndarray, int], episode: int, 
+                     exploration_strategy: str = "ucb") -> int:
+        """
+        选择动作（基于贝叶斯探索策略）
+        
+        Args:
+            state: 当前状态
+            episode: 当前episode编号
+            exploration_strategy: 探索策略 ("ucb", "thompson", "epsilon_greedy")
+        
+        Returns:
+            选择的动作索引
+        """
+        state_key = tuple(state) if isinstance(state, (list, np.ndarray)) else state
+        means = self.q_means[state_key]
+        vars = self.q_vars[state_key]
+        
+        if exploration_strategy == "ucb":
+            # 基于不确定性的上置信界
+            n_visits = np.array([self.state_action_visit_count.get((state_key, a), 0) for a in range(self.n_actions)])
+            
+            # 使用配置中的UCB参数
+            ucb_c = BQL_CONFIG.get('ucb_c', 2.5)
+            ucb_bonus_scale = BQL_CONFIG.get('ucb_bonus_scale', 2.0)
+            
+            # 改进的UCB计算，避免初始阶段探索不足
+            total_visits = self.state_visit_count.get(state_key, 0)
+            if total_visits == 0:
+                # 初始阶段：综合考虑先验均值和不确定性，引入随机扰动
+                exploration_bonus = np.sqrt(vars) / np.max(np.sqrt(vars))  # 标准化不确定性
+                random_noise = np.random.normal(0, 0.1, self.n_actions)  # 小幅度随机噪声
+                # 平衡先验信念和探索：均值 + 探索奖励 + 随机扰动
+                ucb_values = means + 0.5 * exploration_bonus + random_noise
+            else:
+                # 正常UCB计算
+                log_total = np.log(total_visits + 1)
+                # 避免除零，给未访问的动作最大探索奖励
+                ucb_bonus = ucb_c * np.sqrt(log_total / (n_visits + 1e-6))
+                ucb_values = means + ucb_bonus_scale * ucb_bonus * np.sqrt(vars)
+            
+            return np.argmax(ucb_values)
+            
+        elif exploration_strategy == "thompson":
+            # Thompson采样：从高斯分布中采样
+            sampled_values = np.random.normal(means, np.sqrt(vars))
+            return np.argmax(sampled_values)
+            
+        else:  # epsilon_greedy
+            # ε-贪心策略，使用均值
+            epsilon = max(0.1, 1.0 / (episode + 1))
+            if np.random.random() < epsilon:
+                return np.random.randint(self.n_actions)
+            else:
+                return np.argmax(means)
+    
+    def _normalize_reward(self, reward: float) -> float:
+        """归一化奖励值，防止极端值"""
+        # 使用tanh函数将奖励压缩到合理范围
+        normalized = np.tanh(reward * self.reward_scale)
+        # 然后缩放到与先验均值匹配的范围
+        return normalized * 100.0  # 假设先验均值在50左右
+    
+    def _detect_anomalous_q_value(self, state_key: Union[tuple, int], action: int, 
+                                  new_mean: float, new_var: float) -> bool:
+        """检测异常Q值更新"""
+        # 检查Q值是否超出合理范围
+        if abs(new_mean) > self.q_value_max:
+            return True
+        
+        # 检查方差是否过小（过度自信）
+        if new_var < self.min_variance:
+            return True
+        
+        # 检查Q值变化是否过于剧烈
+        history = self.q_value_history.get((state_key, action), [])
+        if len(history) >= 3:  # 需要至少3个历史值
+            recent_mean = np.mean(history[-3:])
+            if recent_mean != 0 and abs(new_mean - recent_mean) / abs(recent_mean) > self.max_q_value_change:
+                return True
+        
+        return False
+    
+    def update_bayesian_q_table(self, state: Union[List, np.ndarray, int], action: int, 
+                               reward: float, next_state: Union[List, np.ndarray, int], 
+                               done: bool) -> Tuple[float, float]:
+        """
+        使用贝叶斯推断更新Q值分布 - 改进版
+        
+        根据贝叶斯定理，更新后验分布参数：
+        σ²_new = (1/σ²_old + 1/σ²_r)^(-1)
+        μ_new = σ²_new * (μ_old/σ²_old + y/σ²_r)
+        
+        Args:
+            state: 当前状态
+            action: 执行的动作
+            reward: 获得的奖励
+            next_state: 下一个状态
+            done: 是否结束
+            
+        Returns:
+            Tuple[float, float]: 更新后的(均值, 方差)
+        """
+        state_key = tuple(state) if isinstance(state, (list, np.ndarray)) else state
+        next_state_key = tuple(next_state) if isinstance(next_state, (list, np.ndarray)) else next_state
+        
+        # 更新访问计数
+        self.state_visit_count[state_key] += 1
+        self.state_action_visit_count[(state_key, action)] += 1
+        
+        # 获取当前分布参数
+        current_mean = self.q_means[state_key][action]
+        current_var = self.q_vars[state_key][action]
+        
+        # 归一化奖励，防止极端值
+        normalized_reward = self._normalize_reward(reward)
+        
+        # 计算TD目标 y = r + γ * max_a' μ_{s',a'}
+        if done:
+            td_target = normalized_reward
+        else:
+            next_means = self.q_means[next_state_key]
+            # 使用鲁棒的max估计，避免异常值影响
+            max_next_mean = np.percentile(next_means, 90)  # 使用90分位数而非最大值
+            td_target = normalized_reward + self.discount_factor * max_next_mean
+        
+        # 限制TD目标的范围
+        td_target = np.clip(td_target, -self.q_value_max, self.q_value_max)
+        
+        # 改进的贝叶斯更新：考虑TD目标的不确定性
+        if not done:
+            # 计算下一状态Q值的最大值的不确定性
+            next_vars = self.q_vars[next_state_key]
+            # 同样使用90分位数对应的不确定性
+            top_10_percent_count = max(1, int(np.ceil(len(next_means) * 0.1)))
+            max_idx = np.argsort(next_means)[-top_10_percent_count:]
+            max_next_var = np.mean([next_vars[i] for i in max_idx]) if len(max_idx) > 0 else np.mean(next_vars)
+            # TD目标的总不确定性 = 奖励噪声 + 折扣后的下一状态不确定性
+            td_target_var = self.observation_noise_var + (self.discount_factor ** 2) * max_next_var
+        else:
+            td_target_var = self.observation_noise_var
+        
+        # 确保方差在合理范围内
+        td_target_var = max(td_target_var, self.min_variance)
+        
+        # 贝叶斯更新，使用TD目标的总不确定性
+        new_var = 1.0 / (1.0 / current_var + 1.0 / td_target_var)
+        new_mean = new_var * (current_mean / current_var + td_target / td_target_var)
+        
+        # 检测异常Q值更新
+        if self._detect_anomalous_q_value(state_key, action, new_mean, new_var):
+            # 如果检测到异常，使用保守的更新策略
+            learning_rate = 0.1  # 使用较小的学习率
+            new_mean = current_mean + learning_rate * (td_target - current_mean)
+            new_var = max(current_var * 0.99, self.min_variance)  # 稍微减小方差
+        
+        # 确保方差不小于最小值
+        new_var = max(new_var, self.min_variance)
+        
+        # 限制Q值范围
+        new_mean = np.clip(new_mean, -self.q_value_max, self.q_value_max)
+        
+        # 记录Q值历史
+        self.q_value_history[(state_key, action)].append(new_mean)
+        # 只保留最近的历史
+        if len(self.q_value_history[(state_key, action)]) > 10:
+            self.q_value_history[(state_key, action)].pop(0)
+        
+        # 更新分布参数
+        self.q_means[state_key][action] = new_mean
+        self.q_vars[state_key][action] = new_var
+        
+        return new_mean, new_var
+    
+    def get_uncertainty(self, state: Union[List, np.ndarray, int], action: int = None) -> Union[float, np.ndarray]:
+        """获取状态-动作对的不确定性（标准差）- 改进版"""
+        state_key = tuple(state) if isinstance(state, (list, np.ndarray)) else state
+        
+        # 确保状态存在，如果不存在则返回先验不确定性
+        if state_key not in self.q_vars:
+            prior_var = BQL_CONFIG.get('prior_var', 15.0)
+            if action is not None:
+                return np.sqrt(prior_var)
+            else:
+                return np.full(self.n_actions, np.sqrt(prior_var))
+        
+        if action is not None:
+            return np.sqrt(max(self.q_vars[state_key][action], self.min_variance))
+        else:
+            return np.sqrt(np.maximum(self.q_vars[state_key], self.min_variance))
+    
+    def get_epsilon(self, episode: int) -> float:
+        """获取当前探索率 - 改进版，支持动态探索"""
+        # 贝叶斯Q-learning使用UCB或Thompson采样，不直接使用epsilon
+        # 但为了兼容性，返回一个基于不确定性的动态探索率
+        
+        # 计算平均不确定性
+        if self.q_means:
+            total_uncertainty = 0.0
+            count = 0
+            for state_key in self.q_means.keys():
+                uncertainties = self.get_uncertainty(state_key)
+                total_uncertainty += np.mean(uncertainties)
+                count += 1
+            
+            avg_uncertainty = total_uncertainty / count if count > 0 else 1.0
+            
+            # 基于不确定性调整探索率：不确定性高时探索更多
+            base_epsilon = max(0.1, 1.0 / (episode + 1))
+            uncertainty_factor = min(2.0, 1.0 + avg_uncertainty / 10.0)  # 不确定性因子
+            
+            return min(0.5, base_epsilon * uncertainty_factor)
+        else:
+            return max(0.1, 1.0 / (episode + 1))
+    
+    def get_q_value_stats(self) -> Dict[str, float]:
+        """获取Q值统计信息 - 改进版，包含异常检测"""
+        if not self.q_means:
+            return {
+                'zero_q_percentage': 100.0, 
+                'exploration_coverage': 0.0, 
+                'mean_q_value': 0.0, 
+                'num_state_visits': 0,
+                'explored_state_actions': 0,
+                'total_state_actions': 0,
+                'mean_uncertainty': 0.0,
+                'std_uncertainty': 0.0,
+                'min_uncertainty': 0.0,
+                'max_uncertainty': 0.0,
+                'anomalous_q_percentage': 0.0,
+                'high_uncertainty_percentage': 0.0,
+                'unvisited_percentage': 100.0
+            }
+        
+        # 计算零值Q值比例和异常Q值比例
+        all_means = []
+        all_uncertainties = []
+        anomalous_count = 0
+        high_uncertainty_count = 0
+        
+        for state_key in self.q_means.keys():
+            state_means = self.q_means[state_key]
+            state_vars = self.q_vars[state_key]
+            state_uncertainties = np.sqrt(state_vars)
+            
+            all_means.extend(state_means)
+            all_uncertainties.extend(state_uncertainties)
+            
+            # 检测异常Q值
+            for action in range(self.n_actions):
+                if self._detect_anomalous_q_value(state_key, action, state_means[action], state_vars[action]):
+                    anomalous_count += 1
+                
+                # 检测高不确定性（标准差大于先验标准差）
+                if state_uncertainties[action] > np.sqrt(BQL_CONFIG.get('prior_var', 15.0)):
+                    high_uncertainty_count += 1
+        
+        if not all_means:
+            return {
+                'zero_q_percentage': 100.0, 
+                'exploration_coverage': 0.0, 
+                'mean_q_value': 0.0, 
+                'num_state_visits': 0,
+                'explored_state_actions': 0,
+                'total_state_actions': 0,
+                'mean_uncertainty': 0.0,
+                'std_uncertainty': 0.0,
+                'min_uncertainty': 0.0,
+                'max_uncertainty': 0.0,
+                'anomalous_q_percentage': 0.0,
+                'high_uncertainty_percentage': 0.0,
+                'unvisited_percentage': 100.0
+            }
+        
+        zero_q_count = sum(bool(abs(mean) < 0.01) for mean in all_means)
+        zero_q_percentage = (zero_q_count / len(all_means)) * 100
+        
+        anomalous_q_percentage = (anomalous_count / len(all_means)) * 100
+        high_uncertainty_percentage = (high_uncertainty_count / len(all_means)) * 100
+        
+        # 计算平均Q值（排除异常值）
+        normal_means = [mean for mean in all_means if abs(mean) <= self.q_value_max]
+        mean_q_value = np.mean(normal_means) if normal_means else 0.0
+        
+        # 计算不确定性统计
+        mean_uncertainty = np.mean(all_uncertainties)
+        std_uncertainty = np.std(all_uncertainties)
+        min_uncertainty = np.min(all_uncertainties)
+        max_uncertainty = np.max(all_uncertainties)
+        
+        # 计算探索覆盖率（已访问的状态-动作对比例）
+        total_state_action_pairs = len(self.q_means) * self.n_actions
+        visited_state_action_pairs = len(self.state_action_visit_count)
+        exploration_coverage = (visited_state_action_pairs / total_state_action_pairs) * 100 if total_state_action_pairs > 0 else 0.0
+        
+        # 计算未访问的状态-动作对比例
+        unvisited_percentage = 100.0 - exploration_coverage
+        
+        # 计算总状态访问次数
+        num_state_visits = sum(self.state_visit_count.values())
+        
+        return {
+            'zero_q_percentage': zero_q_percentage,
+            'exploration_coverage': exploration_coverage,
+            'mean_q_value': mean_q_value,
+            'num_state_visits': num_state_visits,
+            'explored_state_actions': visited_state_action_pairs,
+            'total_state_actions': total_state_action_pairs,
+            # 贝叶斯Q-learning特有的不确定性统计
+            'mean_uncertainty': mean_uncertainty,
+            'std_uncertainty': std_uncertainty,
+            'min_uncertainty': min_uncertainty,
+            'max_uncertainty': max_uncertainty,
+            # 新增异常检测统计
+            'anomalous_q_percentage': anomalous_q_percentage,
+            'high_uncertainty_percentage': high_uncertainty_percentage,
+            'unvisited_percentage': unvisited_percentage
+        }
+    
+    def discretize_state(self, state_info: Dict[str, Any], season: int, weekday: int) -> int:
+        """离散化状态 - 修复状态映射问题"""
+        inventory_level = state_info['inventory_level']
+        # 确保库存水平在合理范围内
+        inventory_level = max(0, min(inventory_level, 4))  # 库存等级为0-4
+        
+        # 修正状态映射：库存(5) × 季节(3) × 星期(2) = 30种状态
+        # 季节只有3个值：0=淡季，1=平季，2=旺季
+        state_index = inventory_level * 6 + season * 2 + weekday
+        
+        # 确保状态索引在有效范围内
+        return min(state_index, self.n_states - 1)
+    
+    def save_agent(self, filepath: str):
+        """保存智能体状态"""
+        agent_state = {
+            'q_means': dict(self.q_means),
+            'q_vars': dict(self.q_vars),
+            'state_visit_count': dict(self.state_visit_count),
+            'state_action_visit_count': dict(self.state_action_visit_count),
+            'n_states': self.n_states,
+            'n_actions': self.n_actions,
+            'discount_factor': self.discount_factor,
+            'observation_noise_var': self.observation_noise_var
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(agent_state, f)
+    
+    def load_agent(self, filepath: str):
+        """加载智能体状态"""
+        with open(filepath, 'rb') as f:
+            agent_state = pickle.load(f)
+        
+        # 获取配置中的先验参数，确保加载时使用正确的默认值
+        prior_mean = BQL_CONFIG.get('prior_mean', 50.0)
+        prior_var = BQL_CONFIG.get('prior_var', 15.0)
+        
+        self.q_means = defaultdict(lambda: np.full(self.n_actions, prior_mean), agent_state['q_means'])
+        self.q_vars = defaultdict(lambda: np.full(self.n_actions, prior_var), agent_state['q_vars'])
+        self.state_visit_count = defaultdict(int, agent_state['state_visit_count'])
+        self.state_action_visit_count = defaultdict(int, agent_state['state_action_visit_count'])
+        self.n_states = agent_state['n_states']
+        self.n_actions = agent_state['n_actions']
+        self.discount_factor = agent_state['discount_factor']
+        self.observation_noise_var = agent_state['observation_noise_var']
+    
+    def train_episode(self, env: HotelEnvironment, online_bnn_predictor: Optional[Any] = None, 
+                     offline_bnn_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, 
+                     episode: int = 0, exploration_strategy: str = "ucb") -> Tuple[float, int]:
+        """
+        使用贝叶斯Q-Learning训练一个episode
+        
+        Args:
+            env: 酒店环境实例
+            online_bnn_predictor: 线上用户BNN预测器
+            offline_bnn_predictor: 线下用户BNN预测器  
+            date_features: 日期特征数据
+            episode: 当前episode编号
+            exploration_strategy: 探索策略
+            
+        Returns:
+            Tuple[float, int]: (总奖励, 步数)
+        """
+        state_info = env.reset()
+        total_reward = 0.0  # 明确指定为float类型
+        steps: int = 0
+        day_index = 0  # 添加日期索引，避免使用steps作为日期索引
+        
+        # 初始化每日记录
+        daily_rewards: List[float] = []
+        daily_uncertainties: List[float] = []  # 记录不确定性
+        
+        # 获取季节和星期信息
+        if date_features is not None and len(date_features) > 0:
+            season = int(date_features['season'].iloc[0])
+            weekday = int(date_features['is_weekend'].iloc[0])
+        else:
+            season = 0
+            weekday = 0
+        
+        state = self.discretize_state(state_info, season, weekday)
+        
+        done = False
+        while not done:
+            # 选择动作（使用贝叶斯探索策略）
+            action = self.select_action(state, episode, exploration_strategy)
+            
+            # 获取价格信息
+            prices = [60, 90, 120, 150, 180, 210]
+            price = prices[action]
+            
+            # 执行动作
+            next_state_info, reward, done, info = env.step(action, online_bnn_predictor, offline_bnn_predictor, date_features)
+            
+            # 获取当前状态的不确定性
+            current_uncertainty = self.get_uncertainty(state, action)
+            
+            # 修复日期索引处理：使用day_index而不是steps
+            if date_features is not None and day_index + 1 < len(date_features):
+                next_season = int(date_features['season'].iloc[day_index + 1])
+                next_weekday = int(date_features['is_weekend'].iloc[day_index + 1])
+                day_index += 1
+            else:
+                next_season = season
+                next_weekday = weekday
+            
+            next_state = self.discretize_state(next_state_info, next_season, next_weekday)
+            
+            # 使用贝叶斯更新Q表
+            new_mean, new_var = self.update_bayesian_q_table(state, action, reward, next_state, done)
+            
+            # 记录信息
+            daily_rewards.append(float(reward))
+            daily_uncertainties.append(float(current_uncertainty))
+            
+            # 打印训练信息（包含不确定性）
+            if steps % 10 == 0:
+                print(f"Episode {episode}, Step {steps}: 动作={action}({price}元), "
+                      f"奖励={reward:.2f}, Q均值={new_mean:.2f}, Q方差={new_var:.2f}, "
+                      f"不确定性={current_uncertainty:.2f}")
+            
+            total_reward += reward
+            steps += 1
+            state = next_state
+            
+            if steps >= 200:  # 防止无限循环
+                break
+        
+        # 记录训练历史
+        episode_history = {
+            'episode': episode,
+            'total_reward': total_reward,
+            'steps': steps,
+            'avg_reward': float(total_reward / steps) if steps > 0 else 0.0,
+            'avg_uncertainty': float(np.mean(daily_uncertainties)) if daily_uncertainties else 0.0,
+            'exploration_strategy': exploration_strategy
+        }
+        self.training_history.append(episode_history)
+        
+        return total_reward, steps
+
 
 if __name__ == "__main__":
     print("正在测试强化学习系统...")

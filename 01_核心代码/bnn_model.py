@@ -306,7 +306,7 @@ class BayesianNN(nn.Module):
             - 通过条件'.' not in name只选择顶层模块
             - KL散度用于衡量学习分布与先验分布的差异
         """
-        kl = 0.0
+        kl = torch.tensor(0.0)
         
         # 隐藏层的KL散度
         for layer in self.hidden_layers:
