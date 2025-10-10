@@ -6,31 +6,32 @@
 """
 
 
-import os
-import sys
-import pickle
-import warnings
+# 标准库导入
 import argparse
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict
+import os
+import pickle
+import sys
 import traceback
+import warnings
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Tuple
 
+# 第三方库导入
+import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import matplotlib.pyplot as plt
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
-import joblib
 
-
+# 本地模块导入
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-
-from data_preprocessing import HotelDataPreprocessor
 from bnn_model import BNNTrainer
-from rl_system import HotelRLSystem, QLearningAgent, HotelEnvironment
-from config import RL_CONFIG, BNN_CONFIG, SIMULATION_CONFIG, BQL_CONFIG
+from config import BNN_CONFIG, BQL_CONFIG, RL_CONFIG, SIMULATION_CONFIG, DATA_SPLIT_CONFIG
+        
+from data_preprocessing import HotelDataPreprocessor
+from rl_system import HotelEnvironment, HotelRLSystem, QLearningAgent
 
 # 配置警告过滤器
 warnings.filterwarnings('ignore')
@@ -381,49 +382,68 @@ def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd
         print(f"{customer_type}训练数据构造完成：X形状{X.shape}, y形状{y.shape}")
         print(f"{customer_type}目标值范围：{y.min():.3f} - {y.max():.3f}（标准化后）")
         
-        # 使用配置中的数据划分设置
-        from config import DATA_SPLIT_CONFIG
-        from sklearn.model_selection import train_test_split
-        
-        # 根据配置选择划分方法
-        if DATA_SPLIT_CONFIG['method'] == 'random':
-            # 随机划分，避免时间序列偏差
-            X_temp, X_test, y_temp, y_test = train_test_split(
-                X, y, test_size=DATA_SPLIT_CONFIG['test_ratio'], 
-                random_state=DATA_SPLIT_CONFIG['random_seed'], 
-                shuffle=DATA_SPLIT_CONFIG['shuffle']
+
+        # 根据配置选择抽取方法
+        if DATA_SPLIT_CONFIG['method'] in ['random_sample', 'sequential_sample']:
+            # 随机抽取或顺序抽取
+            X_train, X_val, X_test, y_train, y_val, y_test = preprocessor.sample_data(
+                X, y, 
+                method=DATA_SPLIT_CONFIG['method'],
+                train_samples=DATA_SPLIT_CONFIG['train_samples'],
+                val_samples=DATA_SPLIT_CONFIG['val_samples'], 
+                test_samples=DATA_SPLIT_CONFIG['test_samples'],
+                random_seed=DATA_SPLIT_CONFIG['random_seed'],
+                stratify_by=DATA_SPLIT_CONFIG['stratify_by'],
+                ensure_diversity=DATA_SPLIT_CONFIG['ensure_diversity']
             )
             
-            # 再从临时集中划分验证集和测试集
-            val_ratio_adjusted = DATA_SPLIT_CONFIG['val_ratio'] / (DATA_SPLIT_CONFIG['val_ratio'] + DATA_SPLIT_CONFIG['test_ratio'])
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_temp, y_temp, test_size=val_ratio_adjusted, 
-                random_state=DATA_SPLIT_CONFIG['random_seed'], 
-                shuffle=DATA_SPLIT_CONFIG['shuffle']
-            )
-            
-            print(f"使用随机划分完成：")
+            print(f"使用{DATA_SPLIT_CONFIG['method']}抽取完成：")
             print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
             print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
             print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
             
         else:
-            # 时间顺序划分，保持时间序列特性
-            total_samples = len(X)
-            train_size = int(total_samples * DATA_SPLIT_CONFIG['train_ratio'])
-            val_size = int(total_samples * DATA_SPLIT_CONFIG['val_ratio'])
+            # 向后兼容：使用比例划分
+            from sklearn.model_selection import train_test_split
             
-            X_train = X[:train_size]
-            X_val = X[train_size:train_size + val_size]
-            X_test = X[train_size + val_size:]
-            y_train = y[:train_size]
-            y_val = y[train_size:train_size + val_size]
-            y_test = y[train_size + val_size:]
-            
-            print(f"使用时间顺序划分完成：")
-            print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
-            print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
-            print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
+            if DATA_SPLIT_CONFIG['method'] == 'random':
+                # 随机划分，避免时间序列偏差
+                X_temp, X_test, y_temp, y_test = train_test_split(
+                    X, y, test_size=DATA_SPLIT_CONFIG['test_ratio'], 
+                    random_state=DATA_SPLIT_CONFIG['random_seed'], 
+                    shuffle=DATA_SPLIT_CONFIG['shuffle']
+                )
+                
+                # 再从临时集中划分验证集和测试集
+                val_ratio_adjusted = DATA_SPLIT_CONFIG['val_ratio'] / (DATA_SPLIT_CONFIG['val_ratio'] + DATA_SPLIT_CONFIG['test_ratio'])
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X_temp, y_temp, test_size=val_ratio_adjusted, 
+                    random_state=DATA_SPLIT_CONFIG['random_seed'], 
+                    shuffle=DATA_SPLIT_CONFIG['shuffle']
+                )
+                
+                print(f"使用随机划分完成：")
+                print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
+                print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
+                print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
+                
+            else:
+                # 时间顺序划分，保持时间序列特性
+                total_samples = len(X)
+                train_size = int(total_samples * DATA_SPLIT_CONFIG['train_ratio'])
+                val_size = int(total_samples * DATA_SPLIT_CONFIG['val_ratio'])
+                
+                X_train = X[:train_size]
+                X_val = X[train_size:train_size + val_size]
+                X_test = X[train_size + val_size:]
+                y_train = y[:train_size]
+                y_val = y[train_size:train_size + val_size]
+                y_test = y[train_size + val_size:]
+                
+                print(f"使用时间顺序划分完成：")
+                print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
+                print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
+                print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
 
         # 检查是否已有训练好的模型
         if not force_retrain and os.path.exists(model_path):

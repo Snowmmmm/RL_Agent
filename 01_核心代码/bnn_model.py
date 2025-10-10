@@ -11,18 +11,24 @@
 - 数据集封装：酒店数据集的标准化处理
 """
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# 标准库导入
+import os
+import pickle
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# 第三方库导入
 import numpy as np
 import pandas as pd
-import pickle
-import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from typing import Optional, Dict, List, Any, Tuple, Union
-import warnings
 
 class BayesianLinear(nn.Module):
     """

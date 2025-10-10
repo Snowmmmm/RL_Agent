@@ -1,10 +1,17 @@
-import pandas as pd
-import numpy as np
-import torch
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# 标准库导入
 import pickle
 import warnings
-from typing import Optional, Dict, List, Any, Union, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# 第三方库导入
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
 warnings.filterwarnings('ignore')
 
 class HotelDataPreprocessor:
@@ -442,80 +449,206 @@ class HotelDataPreprocessor:
         
         return torch.FloatTensor(features)
     
-    def split_data(self, X, y, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, method='random', random_seed=42, stratify_by=None):
+    def sample_data(self, X, y, method='random_sample', train_samples=400, 
+                   val_samples=200, test_samples=193, random_seed=42, 
+                   stratify_by=None, ensure_diversity=True):
         """
-        划分训练集、验证集和测试集
+        随机抽取数据集，而不是简单划分
         
-        参数:
+        支持两种抽取方式：
+        1. 随机抽取：从整个数据池中随机选择指定数量的样本，确保多样性
+        2. 顺序抽取：按时间顺序选择指定数量的样本
+        
+        Args:
             X: 特征数据
-            y: 标签数据
-            train_ratio: 训练集比例
-            val_ratio: 验证集比例
-            test_ratio: 测试集比例
-            method: 划分方法 ('random' 或 'sequential')
-            random_seed: 随机种子
+            y: 目标变量
+            method: 抽取方法，'random_sample'表示随机抽取，'sequential_sample'表示顺序抽取
+            train_samples: 训练集样本数量
+            val_samples: 验证集样本数量
+            test_samples: 测试集样本数量
+            random_seed: 随机种子，确保可重复性
             stratify_by: 分层抽样的列名，None表示不进行分层抽样
+            ensure_diversity: 是否确保抽取样本的多样性
             
-        返回:
-            X_train, X_val, X_test, y_train, y_val, y_test
+        Returns:
+            tuple: (X_train, X_val, X_test, y_train, y_val, y_test)
+            
+        Note:
+            - 随机抽取确保从整个数据池中随机选择样本，避免局部偏差
+            - 可以精确控制每个数据集的样本数量
+            - 支持多样性检查，确保抽取样本在关键特征上的代表性
+            - 适用于需要从大数据集中抽取代表性子集的场景
         """
-        if method == 'random':
-            # 随机划分，避免时间序列偏差
-            from sklearn.model_selection import train_test_split
+        if method == 'random_sample':
+            # 随机抽取，从整个数据池中随机选择指定数量的样本
             
-            # 准备分层抽样的目标变量
-            stratify_data = None
-            if stratify_by is not None and hasattr(X, 'columns'):
-                if stratify_by in X.columns:
-                    stratify_data = X[stratify_by]
+            total_samples = len(X)
+            print(f"总数据池大小: {total_samples} 样本")
+            print(f"目标抽取数量: 训练集{train_samples} + 验证集{val_samples} + 测试集{test_samples} = {train_samples + val_samples + test_samples} 样本")
+            
+            # 检查样本数量是否足够
+            if train_samples + val_samples + test_samples > total_samples:
+                print(f"[警告] 请求的样本总数超过可用数据，将按比例调整")
+                # 按比例调整样本数量
+                total_requested = train_samples + val_samples + test_samples
+                train_samples = int(train_samples * total_samples / total_requested)
+                val_samples = int(val_samples * total_samples / total_requested)
+                test_samples = total_samples - train_samples - val_samples
+                print(f"调整后抽取数量: 训练集{train_samples} + 验证集{val_samples} + 测试集{test_samples} = {total_samples} 样本")
+            
+            # 设置随机种子确保可重复性
+            np.random.seed(random_seed)
+            
+            # 创建样本索引
+            all_indices = np.arange(total_samples)
+            
+            # 分层抽样处理
+            if stratify_by and hasattr(X, 'columns') and stratify_by in X.columns:
+                # 使用分层抽样确保各数据集中关键特征的平衡
+                stratify_data = X[stratify_by].values
+                
+                # 首先抽取训练集
+                train_indices, remaining_indices = train_test_split(
+                    all_indices, train_size=train_samples, random_state=random_seed,
+                    stratify=stratify_data[all_indices]
+                )
+                
+                # 从剩余样本中抽取验证集
+                val_size = min(val_samples, len(remaining_indices))
+                if val_size > 0:
+                    val_indices, test_remaining = train_test_split(
+                        remaining_indices, train_size=val_size, random_state=random_seed + 1,
+                        stratify=stratify_data[remaining_indices] if len(remaining_indices) > 0 else None
+                    )
                 else:
-                    print(f"警告: 分层列 '{stratify_by}' 不存在，将使用普通随机划分")
+                    val_indices = np.array([])
+                    test_remaining = remaining_indices
+                
+                # 剩余的作为测试集
+                test_indices = test_remaining[:min(test_samples, len(test_remaining))]
+                
+            else:
+                # 完全随机抽取
+                np.random.shuffle(all_indices)
+                
+                train_indices = all_indices[:train_samples]
+                val_indices = all_indices[train_samples:train_samples + val_samples]
+                test_indices = all_indices[train_samples + val_samples:train_samples + val_samples + test_samples]
             
-            # 首先划分出训练集和临时集（验证+测试）
-            X_train, X_temp, y_train, y_temp = train_test_split(
-                X, y, test_size=(val_ratio + test_ratio), random_state=random_seed, 
-                shuffle=True, stratify=stratify_data
-            )
+            # 根据索引抽取数据
+            if hasattr(X, 'iloc'):  # DataFrame
+                X_train = X.iloc[train_indices]
+                X_val = X.iloc[val_indices] if len(val_indices) > 0 else X.iloc[:0]
+                X_test = X.iloc[test_indices] if len(test_indices) > 0 else X.iloc[:0]
+                y_train = y.iloc[train_indices]
+                y_val = y.iloc[val_indices] if len(val_indices) > 0 else y.iloc[:0]
+                y_test = y.iloc[test_indices] if len(test_indices) > 0 else y.iloc[:0]
+            else:  # numpy数组
+                X_train = X[train_indices]
+                X_val = X[val_indices] if len(val_indices) > 0 else X[:0]
+                X_test = X[test_indices] if len(test_indices) > 0 else X[:0]
+                y_train = y[train_indices]
+                y_val = y[val_indices] if len(val_indices) > 0 else y[:0]
+                y_test = y[test_indices] if len(test_indices) > 0 else y[:0]
             
-            # 再从临时集中划分验证集和测试集
-            val_ratio_adjusted = val_ratio / (val_ratio + test_ratio)
-            stratify_temp = None
-            if stratify_data is not None:
-                # 对于第二次划分，使用临时集的对应分层数据
-                stratify_temp = stratify_data.iloc[len(X_train):]
+            print(f"随机抽取完成:")
+            print(f"  训练集: {len(X_train)} 样本")
+            print(f"  验证集: {len(X_val)} 样本")
+            print(f"  测试集: {len(X_test)} 样本")
             
-            X_val, X_test, y_val, y_test = train_test_split(
-                X_temp, y_temp, test_size=(1 - val_ratio_adjusted), random_state=random_seed, 
-                shuffle=True, stratify=stratify_temp
-            )
+            # 多样性检查
+            if ensure_diversity and hasattr(X_train, 'columns'):
+                self._check_sample_diversity(X_train, X_val, X_test)
             
-            print(f"随机划分完成:")
-            print(f"  训练集: {len(X_train)} 样本 ({len(X_train)/len(X)*100:.1f}%)")
-            print(f"  验证集: {len(X_val)} 样本 ({len(X_val)/len(X)*100:.1f}%)")
-            print(f"  测试集: {len(X_test)} 样本 ({len(X_test)/len(X)*100:.1f}%)")
+        elif method == 'sequential_sample':
+            # 顺序抽取，按时间顺序选择指定数量的样本
+            total_samples = len(X)
+            print(f"总数据池大小: {total_samples} 样本")
+            
+            # 检查样本数量是否足够
+            requested_total = train_samples + val_samples + test_samples
+            if requested_total > total_samples:
+                print(f"[警告] 请求的样本总数超过可用数据，将按比例调整")
+                # 按比例调整样本数量
+                train_samples = int(train_samples * total_samples / requested_total)
+                val_samples = int(val_samples * total_samples / requested_total)
+                test_samples = total_samples - train_samples - val_samples
+            
+            # 按顺序抽取
+            if hasattr(X, 'iloc'):  # DataFrame
+                X_train = X.iloc[:train_samples]
+                X_val = X.iloc[train_samples:train_samples + val_samples]
+                X_test = X.iloc[train_samples + val_samples:train_samples + val_samples + test_samples]
+                y_train = y.iloc[:train_samples]
+                y_val = y.iloc[train_samples:train_samples + val_samples]
+                y_test = y.iloc[train_samples + val_samples:train_samples + val_samples + test_samples]
+            else:  # numpy数组
+                X_train = X[:train_samples]
+                X_val = X[train_samples:train_samples + val_samples]
+                X_test = X[train_samples + val_samples:train_samples + val_samples + test_samples]
+                y_train = y[:train_samples]
+                y_val = y[train_samples:train_samples + val_samples]
+                y_test = y[train_samples + val_samples:train_samples + val_samples + test_samples]
+            
+            print(f"顺序抽取完成:")
+            print(f"  训练集: {len(X_train)} 样本")
+            print(f"  验证集: {len(X_val)} 样本")
+            print(f"  测试集: {len(X_test)} 样本")
             
         else:
-            # 时间顺序划分，保持时间序列特性
-            total_samples = len(X)
-            train_size = int(total_samples * train_ratio)
-            val_size = int(total_samples * val_ratio)
-            
-            X_train = X[:train_size]
-            X_val = X[train_size:train_size + val_size]
-            X_test = X[train_size + val_size:]
-            y_train = y[:train_size]
-            y_val = y[train_size:train_size + val_size]
-            y_test = y[train_size + val_size:]
-            
-            print(f"时间顺序划分完成:")
-            print(f"  训练集: {len(X_train)} 样本 ({len(X_train)/len(X)*100:.1f}%)")
-            print(f"  验证集: {len(X_val)} 样本 ({len(X_val)/len(X)*100:.1f}%)")
-            print(f"  测试集: {len(X_test)} 样本 ({len(X_test)/len(X)*100:.1f}%)")
+            # 向后兼容：旧的随机划分方法
+            print(f"[警告] 使用方法 '{method}' 不存在，使用默认随机抽取")
+            return self.sample_data(X, y, method='random_sample', train_samples=train_samples,
+                                  val_samples=val_samples, test_samples=test_samples,
+                                  random_seed=random_seed, stratify_by=stratify_by,
+                                  ensure_diversity=ensure_diversity)
         
         # 分析划分结果的分布特征
-        self._analyze_split_distribution(X_train, X_val, X_test, method == 'random')
+        self._analyze_split_distribution(X_train, X_val, X_test, method == 'random_sample')
         
+        # 返回抽取结果
         return X_train, X_val, X_test, y_train, y_val, y_test
+    
+    def _check_sample_diversity(self, X_train, X_val, X_test):
+        """
+        检查抽取样本的多样性，确保代表性
+        
+        Args:
+            X_train: 训练集
+            X_val: 验证集
+            X_test: 测试集
+        """
+        print(f"\n=== 样本多样性检查 ===")
+        
+        if hasattr(X_train, 'columns'):
+            # 检查时间分布多样性
+            if 'date' in X_train.columns:
+                train_dates = pd.to_datetime(X_train['date'])
+                val_dates = pd.to_datetime(X_val['date'])
+                test_dates = pd.to_datetime(X_test['date'])
+                
+                print(f"时间多样性检查:")
+                print(f"  训练集时间跨度: {(train_dates.max() - train_dates.min()).days} 天")
+                print(f"  验证集时间跨度: {(val_dates.max() - val_dates.min()).days} 天")
+                print(f"  测试集时间跨度: {(test_dates.max() - test_dates.min()).days} 天")
+            
+            # 检查价格分布多样性
+            if 'avg_price' in X_train.columns:
+                train_price_std = X_train['avg_price'].std()
+                val_price_std = X_val['avg_price'].std()
+                test_price_std = X_test['avg_price'].std()
+                
+                print(f"价格多样性检查:")
+                print(f"  训练集价格标准差: {train_price_std:.2f}")
+                print(f"  验证集价格标准差: {val_price_std:.2f}")
+                print(f"  测试集价格标准差: {test_price_std:.2f}")
+                
+                # 检查价格范围覆盖
+                min_price = min(X_train['avg_price'].min(), X_val['avg_price'].min(), X_test['avg_price'].min())
+                max_price = max(X_train['avg_price'].max(), X_val['avg_price'].max(), X_test['avg_price'].max())
+                print(f"  价格范围覆盖: {min_price:.0f} - {max_price:.0f} 元")
+        
+        print(f"=== 多样性检查完成 ===\n")
     
     def _analyze_split_distribution(self, X_train, X_val, X_test, is_random: bool = False) -> None:
         """
