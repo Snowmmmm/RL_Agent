@@ -1384,6 +1384,24 @@ class HotelRLSystem:
             print(f"平均价格: {avg_stats['average_price']:.2f}")
         
         return avg_stats, all_stats
+    
+    def is_standard_ql_agent(self) -> bool:
+        """
+        检查是否使用标准Q-learning算法
+        
+        Returns:
+            bool: 如果是标准Q-learning算法返回True，否则返回False
+        """
+        return isinstance(self.agent, QLearningAgent)
+    
+    def is_bayesian_ql_agent(self) -> bool:
+        """
+        检查是否使用贝叶斯Q-learning算法
+        
+        Returns:
+            bool: 如果是贝叶斯Q-learning算法返回True，否则返回False
+        """
+        return isinstance(self.agent, BayesianQLearning)
 
 class BayesianQLearning:
     """

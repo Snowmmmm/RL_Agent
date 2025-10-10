@@ -442,42 +442,168 @@ class HotelDataPreprocessor:
         
         return torch.FloatTensor(features)
     
-    def split_data(self, features_df: pd.DataFrame, train_ratio: float = 0.7, val_ratio: float = 0.15) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def split_data(self, X, y, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, method='random', random_seed=42, stratify_by=None):
         """
-        划分训练、验证和测试数据
+        划分训练集、验证集和测试集
         
-        按照时间顺序将数据划分为训练集、验证集和测试集，确保数据的时间序列特性。
-        这种划分方式对于时间序列预测任务非常重要，避免了数据泄露问题。
+        参数:
+            X: 特征数据
+            y: 标签数据
+            train_ratio: 训练集比例
+            val_ratio: 验证集比例
+            test_ratio: 测试集比例
+            method: 划分方法 ('random' 或 'sequential')
+            random_seed: 随机种子
+            stratify_by: 分层抽样的列名，None表示不进行分层抽样
+            
+        返回:
+            X_train, X_val, X_test, y_train, y_val, y_test
+        """
+        if method == 'random':
+            # 随机划分，避免时间序列偏差
+            from sklearn.model_selection import train_test_split
+            
+            # 准备分层抽样的目标变量
+            stratify_data = None
+            if stratify_by is not None and hasattr(X, 'columns'):
+                if stratify_by in X.columns:
+                    stratify_data = X[stratify_by]
+                else:
+                    print(f"警告: 分层列 '{stratify_by}' 不存在，将使用普通随机划分")
+            
+            # 首先划分出训练集和临时集（验证+测试）
+            X_train, X_temp, y_train, y_temp = train_test_split(
+                X, y, test_size=(val_ratio + test_ratio), random_state=random_seed, 
+                shuffle=True, stratify=stratify_data
+            )
+            
+            # 再从临时集中划分验证集和测试集
+            val_ratio_adjusted = val_ratio / (val_ratio + test_ratio)
+            stratify_temp = None
+            if stratify_data is not None:
+                # 对于第二次划分，使用临时集的对应分层数据
+                stratify_temp = stratify_data.iloc[len(X_train):]
+            
+            X_val, X_test, y_val, y_test = train_test_split(
+                X_temp, y_temp, test_size=(1 - val_ratio_adjusted), random_state=random_seed, 
+                shuffle=True, stratify=stratify_temp
+            )
+            
+            print(f"随机划分完成:")
+            print(f"  训练集: {len(X_train)} 样本 ({len(X_train)/len(X)*100:.1f}%)")
+            print(f"  验证集: {len(X_val)} 样本 ({len(X_val)/len(X)*100:.1f}%)")
+            print(f"  测试集: {len(X_test)} 样本 ({len(X_test)/len(X)*100:.1f}%)")
+            
+        else:
+            # 时间顺序划分，保持时间序列特性
+            total_samples = len(X)
+            train_size = int(total_samples * train_ratio)
+            val_size = int(total_samples * val_ratio)
+            
+            X_train = X[:train_size]
+            X_val = X[train_size:train_size + val_size]
+            X_test = X[train_size + val_size:]
+            y_train = y[:train_size]
+            y_val = y[train_size:train_size + val_size]
+            y_test = y[train_size + val_size:]
+            
+            print(f"时间顺序划分完成:")
+            print(f"  训练集: {len(X_train)} 样本 ({len(X_train)/len(X)*100:.1f}%)")
+            print(f"  验证集: {len(X_val)} 样本 ({len(X_val)/len(X)*100:.1f}%)")
+            print(f"  测试集: {len(X_test)} 样本 ({len(X_test)/len(X)*100:.1f}%)")
+        
+        # 分析划分结果的分布特征
+        self._analyze_split_distribution(X_train, X_val, X_test, method == 'random')
+        
+        return X_train, X_val, X_test, y_train, y_val, y_test
+    
+    def _analyze_split_distribution(self, X_train, X_val, X_test, is_random: bool = False) -> None:
+        """
+        分析数据划分后的分布特征
+        
+        比较训练集、验证集和测试集在时间分布、季节分布和价格分布上的差异，
+        确保随机划分后各集合具有相似的分布特征。
         
         Args:
-            features_df (pd.DataFrame): 完整的特征数据框
-            train_ratio (float, optional): 训练集比例，默认为0.7
-            val_ratio (float, optional): 验证集比例，默认为0.15
+            X_train: 训练集特征数据
+            X_val: 验证集特征数据
+            X_test: 测试集特征数据
+            is_random: 是否使用随机划分
             
         Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: 训练集、验证集、测试集
+            None
             
         Note:
-            - 按照时间顺序划分，避免未来信息泄露
-            - 测试集比例 = 1 - train_ratio - val_ratio
-            - 适用于时间序列预测任务
-            - 数据集大小会打印输出，便于调试
+            - 分析时间范围、季节分布、价格水平等关键特征
+            - 打印各集合的分布统计信息，便于验证划分的合理性
         """
+        print("\n=== 数据划分分布分析 ===")
         
-        n = len(features_df)
-        train_size = int(n * train_ratio)
-        val_size = int(n * val_ratio)
+        # 确保输入的是DataFrame
+        if hasattr(X_train, 'columns'):
+            # 时间范围分析
+            if 'date' in X_train.columns:
+                print(f"时间范围分析：")
+                print(f"训练集：{X_train['date'].min()} 到 {X_train['date'].max()}（{len(X_train)}天）")
+                print(f"验证集：{X_val['date'].min()} 到 {X_val['date'].max()}（{len(X_val)}天）")
+                print(f"测试集：{X_test['date'].min()} 到 {X_test['date'].max()}（{len(X_test)}天）")
+            
+            # 季节分布分析
+            if 'season' in X_train.columns:
+                train_seasons = X_train['season']
+                val_seasons = X_val['season']
+                test_seasons = X_test['season']
+                
+                print(f"\n季节分布分析：")
+                print(f"训练集季节分布：{dict(train_seasons.value_counts().sort_index())}")
+                print(f"验证集季节分布：{dict(val_seasons.value_counts().sort_index())}")
+                print(f"测试集季节分布：{dict(test_seasons.value_counts().sort_index())}")
+            
+            # 价格分布分析
+            if 'avg_price' in X_train.columns:
+                train_prices = X_train['avg_price']
+                val_prices = X_val['avg_price']
+                test_prices = X_test['avg_price']
+                
+                print(f"\n价格分布分析：")
+                print(f"训练集价格：均值={train_prices.mean():.2f}，标准差={train_prices.std():.2f}")
+                print(f"验证集价格：均值={val_prices.mean():.2f}，标准差={val_prices.std():.2f}")
+                print(f"测试集价格：均值={test_prices.mean():.2f}，标准差={test_prices.std():.2f}")
+            
+            # 工作日/周末分布分析
+            if 'is_weekend' in X_train.columns:
+                train_weekend = X_train['is_weekend']
+                val_weekend = X_val['is_weekend']
+                test_weekend = X_test['is_weekend']
+                
+                print(f"\n工作日/周末分布分析：")
+                print(f"训练集工作日占比：{(1-train_weekend.mean())*100:.1f}%，周末占比：{train_weekend.mean()*100:.1f}%")
+                print(f"验证集工作日占比：{(1-val_weekend.mean())*100:.1f}%，周末占比：{val_weekend.mean()*100:.1f}%")
+                print(f"测试集工作日占比：{(1-test_weekend.mean())*100:.1f}%，周末占比：{test_weekend.mean()*100:.1f}%")
         
-        train_data = features_df[:train_size]
-        val_data = features_df[train_size:train_size + val_size]
-        test_data = features_df[train_size + val_size:]
+        elif hasattr(X_train, 'iloc'):  # numpy数组但有iloc方法
+            # 对于numpy数组，只分析数值特征
+            print(f"数值特征分布分析：")
+            print(f"训练集样本数：{len(X_train)}")
+            print(f"验证集样本数：{len(X_val)}")
+            print(f"测试集样本数：{len(X_test)}")
+            
+            if X_train.shape[1] > 0:  # 如果有特征
+                print(f"特征维度：{X_train.shape[1]}")
         
-        print(f"数据划分完成：")
-        print(f"训练集：{len(train_data)}条记录")
-        print(f"验证集：{len(val_data)}条记录")
-        print(f"测试集：{len(test_data)}条记录")
+        else:  # 纯numpy数组
+            print(f"数组形状分析：")
+            print(f"训练集形状：{X_train.shape}")
+            print(f"验证集形状：{X_val.shape}")
+            print(f"测试集形状：{X_test.shape}")
         
-        return train_data, val_data, test_data
+        # 显示划分方法信息
+        if is_random:
+            print(f"\n划分方法：随机划分（避免时间序列偏差）")
+        else:
+            print(f"\n划分方法：时间顺序划分（保持时间序列特性）")
+        
+        print("\n=== 分布分析完成 ===\n")
     
     def save_preprocessor(self, filepath: str) -> None:
         """

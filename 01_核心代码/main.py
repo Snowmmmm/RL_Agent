@@ -381,17 +381,49 @@ def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd
         print(f"{customer_type}训练数据构造完成：X形状{X.shape}, y形状{y.shape}")
         print(f"{customer_type}目标值范围：{y.min():.3f} - {y.max():.3f}（标准化后）")
         
-        # 划分训练集、验证集和测试集
-        n_samples = len(X)
-        train_size = int(0.7 * n_samples)
-        val_size = int(0.15 * n_samples)
+        # 使用配置中的数据划分设置
+        from config import DATA_SPLIT_CONFIG
+        from sklearn.model_selection import train_test_split
         
-        X_train = X[:train_size]
-        y_train = y[:train_size]
-        X_val = X[train_size:train_size + val_size]
-        y_val = y[train_size:train_size + val_size]
-        X_test = X[train_size + val_size:]
-        y_test = y[train_size + val_size:]
+        # 根据配置选择划分方法
+        if DATA_SPLIT_CONFIG['method'] == 'random':
+            # 随机划分，避免时间序列偏差
+            X_temp, X_test, y_temp, y_test = train_test_split(
+                X, y, test_size=DATA_SPLIT_CONFIG['test_ratio'], 
+                random_state=DATA_SPLIT_CONFIG['random_seed'], 
+                shuffle=DATA_SPLIT_CONFIG['shuffle']
+            )
+            
+            # 再从临时集中划分验证集和测试集
+            val_ratio_adjusted = DATA_SPLIT_CONFIG['val_ratio'] / (DATA_SPLIT_CONFIG['val_ratio'] + DATA_SPLIT_CONFIG['test_ratio'])
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_temp, y_temp, test_size=val_ratio_adjusted, 
+                random_state=DATA_SPLIT_CONFIG['random_seed'], 
+                shuffle=DATA_SPLIT_CONFIG['shuffle']
+            )
+            
+            print(f"使用随机划分完成：")
+            print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
+            print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
+            print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
+            
+        else:
+            # 时间顺序划分，保持时间序列特性
+            total_samples = len(X)
+            train_size = int(total_samples * DATA_SPLIT_CONFIG['train_ratio'])
+            val_size = int(total_samples * DATA_SPLIT_CONFIG['val_ratio'])
+            
+            X_train = X[:train_size]
+            X_val = X[train_size:train_size + val_size]
+            X_test = X[train_size + val_size:]
+            y_train = y[:train_size]
+            y_val = y[train_size:train_size + val_size]
+            y_test = y[train_size + val_size:]
+            
+            print(f"使用时间顺序划分完成：")
+            print(f"训练集：{len(X_train)}条记录（{len(X_train)/len(X)*100:.1f}%）")
+            print(f"验证集：{len(X_val)}条记录（{len(X_val)/len(X)*100:.1f}%）")
+            print(f"测试集：{len(X_test)}条记录（{len(X_test)/len(X)*100:.1f}%）")
 
         # 检查是否已有训练好的模型
         if not force_retrain and os.path.exists(model_path):
