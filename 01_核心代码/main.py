@@ -453,6 +453,9 @@ def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd
                 hidden_dims=BNN_CONFIG['hidden_dims'],
                 learning_rate=BNN_CONFIG['learning_rate'],
                 weight_decay=BNN_CONFIG['weight_decay'],
+                prior_mean=BNN_CONFIG['prior_mean'],
+                prior_std=BNN_CONFIG['prior_std'],
+                dropout_rate=BNN_CONFIG['dropout_rate'],
                 device='cuda' if torch.cuda.is_available() else 'cpu'
             )
             bnn_trainer.load_model(model_path)
@@ -467,6 +470,9 @@ def train_bnn_models(preprocessor: HotelDataPreprocessor, online_features_df: pd
                 hidden_dims=BNN_CONFIG['hidden_dims'],
                 learning_rate=BNN_CONFIG['learning_rate'],
                 weight_decay=BNN_CONFIG['weight_decay'],
+                prior_mean=BNN_CONFIG['prior_mean'],
+                prior_std=BNN_CONFIG['prior_std'],
+                dropout_rate=BNN_CONFIG['dropout_rate'],
                 device='cuda' if torch.cuda.is_available() else 'cpu'
             )
             

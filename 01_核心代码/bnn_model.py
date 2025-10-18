@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 class BayesianLinear(nn.Module):
     """
-    贝叶斯线性层 - 修复KL散度计算
+    贝叶斯线性层 
     
     实现了变分推理中的贝叶斯线性层，为权重和偏置学习概率分布而非固定值。
     该层使用重参数化技巧进行高效的梯度下降训练，并提供KL散度计算用于变分损失。
@@ -296,7 +296,7 @@ class BayesianNN(nn.Module):
     
     def kl_divergence(self) -> torch.Tensor:
         """
-        计算总的KL散度 - 修复重复计算问题
+        计算总的KL散度
         
         计算整个贝叶斯神经网络所有贝叶斯层的KL散度总和，
         用于变分损失函数中的正则化项。
@@ -415,7 +415,7 @@ class BNNTrainer:
         
     def elbo_loss(self, predictions: Tuple[torch.Tensor, torch.Tensor], targets: torch.Tensor, kl_div: torch.Tensor, beta: float = 1.0, n_train_samples: int = 5000) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        ELBO损失函数 - 最终修复版本
+        ELBO损失函数 
         
         计算变分推理中的ELBO（Evidence Lower Bound）损失函数，
         用于训练贝叶斯神经网络。

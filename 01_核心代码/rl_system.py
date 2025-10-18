@@ -1170,7 +1170,6 @@ class HotelRLSystem:
         
         功能描述：
         在真实环境中进行在线学习，根据实际交互数据持续优化Q-learning策略和BNN预测模型。
-        修复了原始实现中的关键逻辑问题，提供更鲁棒的增量学习机制。
         
         参数:
             features_df (pd.DataFrame): 在线特征数据，按天提供新的环境信息
@@ -1220,7 +1219,6 @@ class HotelRLSystem:
             weekday = int(day_features['is_weekend'].iloc[0])
             state = self.agent.discretize_state(state_info, season, weekday)
             
-            # 修复1: 使用专门的episode计数器而不是day
             # 在线学习时主要利用已有知识，少量探索
             action = self.agent.select_action(state, episode_counter)
             
@@ -1229,7 +1227,6 @@ class HotelRLSystem:
                 action, self.online_bnn_predictor, self.offline_bnn_predictor, day_features
             )
             
-            # 修复2: 放宽数据收集条件 - 收集所有有意义的交互
             # 原条件: if info['actual_bookings'] > 0
             # 新条件: 只要有预测需求或实际预订就收集
             if info['predicted_demand'] > 0 or info['actual_bookings'] > 0:
@@ -1784,7 +1781,7 @@ class BayesianQLearning:
         }
     
     def discretize_state(self, state_info: Dict[str, Any], season: int, weekday: int) -> int:
-        """离散化状态 - 修复状态映射问题"""
+        """离散化状态"""
         inventory_level = state_info['inventory_level']
         # 确保库存水平在合理范围内
         inventory_level = max(0, min(inventory_level, 4))  # 库存等级为0-4
@@ -1880,7 +1877,7 @@ class BayesianQLearning:
             # 获取当前状态的不确定性
             current_uncertainty = self.get_uncertainty(state, action)
             
-            # 修复日期索引处理：使用day_index而不是steps
+            # 获取下一状态的season和weekday信息
             if date_features is not None and day_index + 1 < len(date_features):
                 next_season = int(date_features['season'].iloc[day_index + 1])
                 next_weekday = int(date_features['is_weekend'].iloc[day_index + 1])
