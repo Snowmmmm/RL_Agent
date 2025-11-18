@@ -228,9 +228,9 @@ DATA_SPLIT_CONFIG = {
 OPTUNA_CONFIG = {
     # 搜索控制参数
     'enable_hyperparameter_search': True,  # 是否启用超参数搜索，False则使用预设最佳参数
-    'n_trials': 75,  # 搜索试验次数
+    'n_trials': 64,  # 搜索试验次数
     'timeout': 3600,  # 搜索超时时间（秒），3600秒=1小时
-    'n_jobs': -1,  # 并行工作数，-1表示使用所有CPU核心
+    'n_jobs': 28,  # 并行工作数，-1表示使用所有CPU核心
     'random_seed': 42,  # 随机种子，确保搜索可重复
     
     # 超参数搜索空间
@@ -274,22 +274,22 @@ OPTUNA_CONFIG = {
 # 每个客户类型和需求类型组合的最佳超参数
 BEST_NGBOOST_PARAMS = {
     '线上用户_booked': {
-        'n_estimators': 200,
-        'learning_rate': 0.005463234721435768,
+        'n_estimators': 150,
+        'learning_rate': 0.00554476117271747,
         'max_depth': 4,
-        'min_samples_split': 30,
-        'min_samples_leaf': 25,
-        'colsample_bytree': 0.8,
+        'min_samples_split': 45,
+        'min_samples_leaf': 20,
+        'colsample_bytree': 0.7,
         'distribution': 'normal',
         'score': 'logscore',
     },
     '线上用户_actual': {
         'n_estimators': 100,
-        'learning_rate': 0.011961560454784656,
-        'max_depth': 6,
-        'min_samples_split': 40,
-        'min_samples_leaf': 25,
-        'colsample_bytree': 0.6,
+        'learning_rate': 0.006897261486434552,
+        'max_depth': 3,
+        'min_samples_split': 25,
+        'min_samples_leaf': 20,
+        'colsample_bytree': 0.8,
         'distribution': 'normal',
         'score': 'logscore',
     },
@@ -330,11 +330,11 @@ RANDOM_CONFIG = {
 # =============================================================================
 # 系统级配置参数，控制硬件使用和全局行为
 SYSTEM_CONFIG = {
-    'use_cuda': True,  # 是否使用CUDA GPU加速（如果可用）
-    'device': 'auto',  # 设备选择：'auto', 'cuda', 'cpu'
+    'use_cuda': False,  # 是否使用CUDA GPU加速（如果可用）
+    'device': 'cpu',  # 设备选择：'auto', 'cuda', 'cpu'
     'random_seed': 42,  # 全局随机种子
-    'max_workers': 4,  # 最大工作进程数（用于并行处理）
-    'memory_limit_gb': 8,  # 内存使用限制（GB）
+    'max_workers': 28,  # 最大工作进程数（用于并行处理）
+    'memory_limit_gb': 24,  # 内存使用限制（GB）
     'enable_gpu_memory_growth': True,  # 是否启用GPU内存增长
     'mixed_precision': False,  # 是否使用混合精度训练
     'compile_models': False,  # 是否编译模型（PyTorch 2.0+）

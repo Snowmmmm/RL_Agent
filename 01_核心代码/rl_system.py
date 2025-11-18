@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # 第三方库导入
 import numpy as np
 import pandas as pd
-import torch
 from scipy import stats
 
 # 本地模块导入
@@ -1144,8 +1143,8 @@ class NGBoostPredictorWrapper:
         self.demand_scaler = demand_scaler
     
     def prepare_features_from_queues(self, date_features: pd.DataFrame, action: int, 
-                                     demand_queues: dict, price_queue: deque, 
-                                     user_type: str, demand_type: str) -> torch.Tensor:
+                                     demand_queues: Dict[str, deque], price_queue: deque,
+                                     user_type: str, demand_type: str) -> np.ndarray:
         """
         从队列数据准备NGBoost模型的输入特征
         
@@ -1166,7 +1165,7 @@ class NGBoostPredictorWrapper:
             demand_type (str): 需求类型（'booked'或'actual'）
             
         Returns:
-            torch.Tensor: 6维特征张量
+             np.ndarray: 6维特征数组
         """
         # 1. 价格特征 - 使用当前定价动作对应的价格
         price_levels = [60, 80, 100, 110, 120, 130, 140, 150]  # 8个价格档位（基于真实数据分布优化）
@@ -1218,7 +1217,7 @@ class NGBoostPredictorWrapper:
         # 组合特征 [价格, 是否周末, 季节, 价格变异系数, 需求趋势, 价格趋势]
         features = [price, is_weekend, season, price_cv, demand_trend, price_trend]
         
-        return torch.FloatTensor(features)
+        return np.array(features, dtype=np.float32)
     
     def __call__(self, date_features: pd.DataFrame, action: int, record_env_changes: bool = False, 
                  user_type: str = None, demand_type: str = None, demand_queues: dict = None, 
@@ -2336,7 +2335,7 @@ if __name__ == "__main__":
     # 创建预处理器（模拟）
     class MockPreprocessor:
         def prepare_ngboost_features(self, date_features, action):
-            return torch.FloatTensor(np.random.randn(1, input_dim).astype(np.float32))
+            return np.random.randn(1, input_dim).astype(np.float32)
     
     preprocessor = MockPreprocessor()
     

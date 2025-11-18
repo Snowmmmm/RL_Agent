@@ -15,8 +15,8 @@ def analyze_actual_demand():
     # ----------------------
     try:
         # 读取线上和线下数据
-        online_df = pd.read_csv('RL_Agent/03_数据文件/online_features.csv')
-        offline_df = pd.read_csv('RL_Agent/03_数据文件/offline_features.csv')
+        online_df = pd.read_csv('../03_数据文件/online_features.csv')
+        offline_df = pd.read_csv('../03_数据文件/offline_features.csv')
         
         # 转换日期格式
         online_df['date'] = pd.to_datetime(online_df['date'])

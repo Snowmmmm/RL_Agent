@@ -20,7 +20,6 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
 
@@ -83,13 +82,6 @@ def check_environment() -> bool:
         - 支持CPU-only模式运行
     """
     print("=== 环境检查 ===")
-    
-    # 检查CUDA
-    if torch.cuda.is_available():
-        print(f"[OK] CUDA可用，设备：{torch.cuda.get_device_name(0)}")
-        print(f"[OK] PyTorch版本：{torch.__version__}")
-    else:
-        print("[WARN] CUDA不可用，将使用CPU")
     
     # 检查Optuna
     if OPTUNA_AVAILABLE:
@@ -808,6 +800,12 @@ def load_and_preprocess_data(data_path: str, force_reprocess: bool = False) -> T
         raw_df = pd.read_csv(data_path)
         print(f"数据加载完成，共{len(raw_df)}条记录")
         
+        # 筛选只保留City Hotel的数据
+        initial_count = len(raw_df)
+        raw_df = raw_df[raw_df['hotel'] == 'City Hotel'].copy()
+        city_hotel_count = len(raw_df)
+        print(f"过滤后只保留City Hotel数据，从{initial_count}条记录减少到{city_hotel_count}条记录")
+        
         # 数据清洗
         cleaned_df = preprocessor.clean_data(raw_df)
         
@@ -914,7 +912,7 @@ def train_ngboost_models(preprocessor: HotelDataPreprocessor, online_features_df
             # 添加少量噪声到标准化需求数据
             noisy_demand = standardized_demand + np.random.normal(0, 0.05)  # 很小的噪声
             
-            X_list.append(features.numpy())
+            X_list.append(features)
             y_list.append(noisy_demand)
         
         X = np.array(X_list)

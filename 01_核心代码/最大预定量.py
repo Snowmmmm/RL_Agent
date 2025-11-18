@@ -14,7 +14,7 @@ def analyze_max_inventory_with_second(hotel_type='City Hotel'):
     # 1. 数据处理与库存计算（复用核心逻辑）
     # ----------------------
     try:
-        df = pd.read_csv('RL_Agent/03_数据文件/hotel_bookings.csv')
+        df = pd.read_csv('../03_数据文件/hotel_bookings.csv')
     except FileNotFoundError:
         print("错误：未找到数据文件，请检查路径")
         return None
@@ -131,8 +131,8 @@ def analyze_max_inventory_with_second(hotel_type='City Hotel'):
     # ----------------------
     try:
         # 读取线上和线下数据
-        online_df = pd.read_csv('RL_Agent/03_数据文件/online_features.csv')
-        offline_df = pd.read_csv('RL_Agent/03_数据文件/offline_features.csv')
+        online_df = pd.read_csv('../03_数据文件/online_features.csv')
+        offline_df = pd.read_csv('../03_数据文件/offline_features.csv')
         
         # 转换日期格式
         online_df['date'] = pd.to_datetime(online_df['date'])

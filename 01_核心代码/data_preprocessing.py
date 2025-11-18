@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # 第三方库导入
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.model_selection import train_test_split
 warnings.filterwarnings('ignore')
 
@@ -252,18 +251,18 @@ class HotelDataPreprocessor:
             
             # 处理每个订单
             for _, booking in bookings_df.iterrows():
-                arrival_date = booking['arrival_date']
-                weekend_nights = booking['stays_in_weekend_nights']
-                week_nights = booking['stays_in_week_nights']
-                is_canceled = booking['is_canceled']
-                adr = booking['adr']
+                arrival_date = booking['arrival_date'] # 到达日期
+                weekend_nights = booking['stays_in_weekend_nights'] # 周末住宿晚数
+                week_nights = booking['stays_in_week_nights'] # 工作日住宿晚数
+                is_canceled = booking['is_canceled'] # 是否取消
+                adr = booking['adr'] # 平均每天价格（实际入住）
                 
                 # 将住宿天数分布到对应日期
                 stay_dates = distribute_stays_to_dates(arrival_date, weekend_nights, week_nights, is_canceled)
                 
                 # 更新预定需求（包含取消的订单）
                 for stay_date, stay_count in stay_dates.items():
-                    daily_booked_demand[stay_date] = daily_booked_demand.get(stay_date, 0) + stay_count
+                    daily_booked_demand[stay_date] = daily_booked_demand.get(stay_date, 0) + stay_count # 预定需求（包含取消的订单）
                 
                 # 更新实际需求（只包含未取消的订单）
                 if is_canceled == 0:
@@ -552,7 +551,7 @@ class HotelDataPreprocessor:
         # 为简化，只考虑周末
         return 1 if date.weekday() >= 5 else 0
     
-    def prepare_ngboost_features(self, features_df: pd.DataFrame, action: Optional[int] = None, price_action: Optional[float] = None, demand_type: str = 'booked', customer_type: str = 'online') -> torch.Tensor:
+    def prepare_ngboost_features(self, features_df: pd.DataFrame, action: Optional[int] = None, price_action: Optional[float] = None, demand_type: str = 'booked', customer_type: str = 'online') -> np.ndarray:
         """
         准备NGBoost模型的输入特征（支持双需求：预定需求/实际需求，线上线下用户）
         
@@ -572,7 +571,7 @@ class HotelDataPreprocessor:
             customer_type (str): 客户类型，'online'表示线上用户，'offline'表示线下用户
             
         Returns:
-            torch.Tensor: 标准化的特征张量，形状为[6]（价格、是否周末、季节、价格变异系数、需求趋势、价格趋势）
+             np.ndarray: 标准化的特征数组，形状为[6]（价格、是否周末、季节、价格变异系数、需求趋势、价格趋势）
             
         Note:
             - 该方法提取了影响酒店需求最核心的六个特征
@@ -642,7 +641,7 @@ class HotelDataPreprocessor:
         # 组合特征 [价格, 是否周末, 季节, 价格变异系数, 需求趋势, 价格趋势]
         features = [price, is_weekend, season, price_cv, demand_trend, price_trend]
         
-        return torch.FloatTensor(features)
+        return np.array(features, dtype=np.float32)
     
     def sample_data(self, X, y, method='random_sample', train_samples=400, 
                    val_samples=200, test_samples=193, random_seed=42, 
