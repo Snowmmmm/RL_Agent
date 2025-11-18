@@ -5,7 +5,7 @@
 import pickle
 import random
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -42,7 +42,9 @@ class HotelEnvironment:
     - weekday: 工作日类型（0=工作日，1=周末）
     
     动作空间：
-    - 6个定价档位：60, 90, 120, 150, 180, 210
+    - 36个定价组合：线上6档 × 线下6档
+    - 线上价格档位：[80, 90, 100, 110, 120, 130]元
+    - 线下价格档位：[90, 105, 120, 135, 150, 165]元
     
     奖励函数：
     - 总收益 = 当日收益 + 未来预期收益
@@ -69,10 +71,15 @@ class HotelEnvironment:
         - 支持90天周期模拟，支持自定义起始日期
     """
     
-    def __init__(self, initial_inventory: int = 100, max_stay_nights: int = 5, 
+    def __init__(self, initial_inventory: int = None, max_stay_nights: int = 5, 
                  cost_per_room: int = 20, beta_distribution: Optional[List[float]] = None):
         
-        self.initial_inventory = initial_inventory # 初始库存
+        # 从配置文件读取客房数量，如果没有显式传递参数
+        if initial_inventory is None:
+            from config import ENV_CONFIG
+            self.initial_inventory = ENV_CONFIG['initial_inventory']
+        else:
+            self.initial_inventory = initial_inventory
         self.max_stay_nights = max_stay_nights # 最大入住天数
         self.cost_per_room = cost_per_room # 每间客房的成本
         self.beta_distribution = beta_distribution or [0.2] * max_stay_nights # Beta分布参数，用于模拟未来需求
@@ -80,6 +87,17 @@ class HotelEnvironment:
         # 初始化未来库存数组：s_t^1, s_t^2, ..., s_t^{T-t+1}
         # 跟踪当前及未来max_stay_nights天的可售客房量
         self.future_inventory = None
+        
+        # 初始化4+1队列系统：4个需求队列和1个价格队列，每个队列记录7天数据
+        self.demand_queues = {
+            'online_booked': deque(maxlen=7),    # 线上用户预定需求队列
+            'online_actual': deque(maxlen=7),    # 线上用户实际需求队列
+            'offline_booked': deque(maxlen=7),   # 线下用户预定需求队列
+            'offline_actual': deque(maxlen=7)     # 线下用户实际需求队列
+        }
+        self.price_queue = deque(maxlen=7)       # 价格队列（兼容旧逻辑）
+        self.price_queue_online = deque(maxlen=7)    # 线上价格队列
+        self.price_queue_offline = deque(maxlen=7)   # 线下价格队列
         
         self.reset()
     
@@ -93,6 +111,7 @@ class HotelEnvironment:
         3. 清空收益和预订统计
         4. 初始化历史记录
         5. 设置未来库存数组
+        6. 清空4+1队列系统
         
         Returns:
             Dict[str, Any]: 初始状态字典，包含库存水平、季节、工作日类型等信息
@@ -120,6 +139,13 @@ class HotelEnvironment:
         # 初始化未来库存数组：s_t^1, s_t^2, ..., s_t^{max_stay_nights+1}
         # 第t天起始时刻观察到当前及未来每一天的可售客房量
         self.future_inventory = [self.initial_inventory] * (self.max_stay_nights + 1)
+        
+        # 清空4+1队列系统
+        for queue_name in self.demand_queues:
+            self.demand_queues[queue_name].clear()
+        self.price_queue.clear()
+        self.price_queue_online.clear()
+        self.price_queue_offline.clear()
         
         return self._get_state()
     
@@ -149,19 +175,23 @@ class HotelEnvironment:
             - 工作日类型：假设第0天为周一，周六日(5,6)为周末
             - 状态编码：库存等级(0-4) × 季节(0-2) × 日期类型(0-1) = 30种状态
         """
-        # 当前库存离散化（s_t^1）
+        # 当前库存离散化（s_t^1）- 注释掉库存数量区分
         current_inventory = self.future_inventory[0] if self.future_inventory else self.current_inventory
         
-        if current_inventory <= 20:
-            inventory_level = 0
-        elif current_inventory <= 40:
-            inventory_level = 1
-        elif current_inventory <= 60:
-            inventory_level = 2
-        elif current_inventory <= 80:
-            inventory_level = 3
-        else:
-            inventory_level = 4
+        # 注释掉库存等级区分，统一使用固定值
+        # if current_inventory <= 20:
+        #     inventory_level = 0
+        # elif current_inventory <= 40:
+        #     inventory_level = 1
+        # elif current_inventory <= 60:
+        #     inventory_level = 2
+        # elif current_inventory <= 80:
+        #     inventory_level = 3
+        # else:
+        #     inventory_level = 4
+        
+        # 统一使用库存等级2（中等库存）
+        inventory_level = 3
         
         # 根据月份确定季节（方案要求：11-2月→淡季0，3-5/9-10月→平季1，6-8月→旺季2）
         month = (self.day // 30) % 12 + 1  # 简化：假设每月30天
@@ -184,23 +214,30 @@ class HotelEnvironment:
             'weekday': weekday_type
         }
     
-    def step(self, action: int, bnn_predictor_online: Optional[Any] = None, bnn_predictor_offline: Optional[Any] = None, date_features: Optional[np.ndarray] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: Union[int, List[int]], 
+             ngboost_predictor_online_booked: Optional[Any] = None,
+             ngboost_predictor_online_actual: Optional[Any] = None,
+             ngboost_predictor_offline_booked: Optional[Any] = None,
+             ngboost_predictor_offline_actual: Optional[Any] = None,
+             date_features: Optional[np.ndarray] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         执行一步酒店定价决策
         
         根据给定的定价动作，模拟一天的酒店运营过程，包括：
-        1. 确定定价：将动作索引转换为具体价格
+        1. 确定定价：将动作索引转换为具体价格（支持线上线下双价格）
         2. 需求预测：使用线上和线下BNN模型预测需求分布，并相加结果
-        3. 预订处理：根据库存限制确定实际预订量
+        3. 预订处理：根据库存限制确定实际预订量（优先满足线下用户）
         4. 收益计算：计算当日收益和未来预期收益
         5. 风险惩罚：基于预测方差添加风险惩罚
         6. 库存更新：根据β系数更新未来库存
         7. 状态转移：获取新的环境状态
         
         Args:
-            action (int): 定价动作索引（0-5，对应6个价格档位）
-            bnn_predictor_online (Optional[Any], optional): 线上用户BNN需求预测器
-            bnn_predictor_offline (Optional[Any], optional): 线下用户BNN需求预测器
+            action (Union[int, List[int]]): 定价动作索引（int为单价格，List[int]为双价格[线上, 线下]）
+            ngboost_predictor_online_booked (Optional[Any], optional): 线上用户预定需求NGBoost预测器
+            ngboost_predictor_online_actual (Optional[Any], optional): 线上用户实际需求NGBoost预测器
+            ngboost_predictor_offline_booked (Optional[Any], optional): 线下用户预定需求NGBoost预测器
+            ngboost_predictor_offline_actual (Optional[Any], optional): 线下用户实际需求NGBoost预测器
             date_features (Optional[np.ndarray], optional): 日期特征数据
             
         Returns:
@@ -215,97 +252,213 @@ class HotelEnvironment:
         2. 未来预期收益 = (价格-成本) × 预测需求 × Σβ₁₋₄（未来入住系数和）
         3. 总收益 = 当日收益 + 未来预期收益
         4. 风险惩罚 = λ × 预测方差（按季节调整λ系数）
-        5. 最终奖励 = 总收益 - 风险惩罚
+        5. 最终奖励 = 总收益
                 
         Note:
-            - 价格档位：60, 90, 120, 150, 180, 210
+            - 价格档位：线上[80,90,100,110,120,130]，线下[90,105,120,135,150,165]
             - 需求预测为线上和线下BNN预测结果相加
             - 收益计算考虑当日入住和未来预期入住
             - 风险惩罚系数按季节调整（旺季0.1，平季0.25，淡季0.5）
             - 库存更新使用β系数分布，反映不同入住天数的影响
             - 支持90天周期模拟，episode在90天时结束
         """
+        # print(f" \n {'+'*15}一个episode开始{'+'*15}")
+        # 定价动作（线上线下双价格映射）
+        # 从配置文件读取定价档位
+        from config import ENV_CONFIG
+        online_prices = ENV_CONFIG['online_price_levels']  # 线上价格档位（6个动作）
+        offline_prices = ENV_CONFIG['offline_price_levels']  # 线下价格档位（6个动作）
         
-        # 定价动作（6个档位：60, 90, 120, 150, 180, 210）
-        prices = [60, 90, 120, 150, 180, 210]
-        price = prices[action]
+        # 处理36个动作组合：action_idx = online_idx * 6 + offline_idx
+        if hasattr(action, 'item'):
+            action_idx = int(action.item())
+        else:
+            action_idx = int(action)
         
-        # 使用线上和线下BNN预测需求，并相加结果
-        predicted_demand_online = 0
-        predicted_variance_online = 0
-        predicted_demand_offline = 0
-        predicted_variance_offline = 0
+        # 36个动作组合映射到线上线下价格索引
+        online_idx = action_idx // 6  # 线上价格索引 (0-5)
+        offline_idx = action_idx % 6   # 线下价格索引 (0-5)
+        
+        price_online = online_prices[online_idx]
+        price_offline = offline_prices[offline_idx]
+        
+        # 统一使用线上价格进行历史记录（兼容旧逻辑）
+        price = price_online
+        
+        # 分别获取线上和线下的预定需求与实际需求预测
+        predicted_booked_demand_online = 0
+        predicted_booked_variance_online = 0
+        predicted_actual_demand_online = 0
+        predicted_actual_variance_online = 0
+        predicted_booked_demand_offline = 0
+        predicted_booked_variance_offline = 0
+        predicted_actual_demand_offline = 0
+        predicted_actual_variance_offline = 0
+        
+        # 确定用于预测的动作索引（36个动作组合映射）
+        action_online = online_idx  # 线上价格索引 (0-5)
+        action_offline = offline_idx  # 线下价格索引 (0-5)
         
         if date_features is not None:
-            # 获取线上用户BNN预测
-            if bnn_predictor_online is not None:
-                demand_online, variance_online = bnn_predictor_online(date_features, action)
-                predicted_demand_online = demand_online
-                predicted_variance_online = variance_online
+            # 获取线上用户预定需求NGBoost预测（使用线上价格）
+            if ngboost_predictor_online_booked is not None:
+                booked_demand_online, booked_variance_online = ngboost_predictor_online_booked(
+                    date_features, action_online, record_env_changes=True, user_type='online', demand_type='booked',
+                    demand_queues=self.demand_queues, price_queue=self.price_queue_online
+                )
+                predicted_booked_demand_online = booked_demand_online
+                predicted_booked_variance_online = booked_variance_online
+
+            # 获取线上用户实际需求NGBoost预测（使用线上价格）
+            if ngboost_predictor_online_actual is not None:
+                actual_demand_online, actual_variance_online = ngboost_predictor_online_actual(
+                    date_features, action_online, record_env_changes=True, user_type='online', demand_type='actual',
+                    demand_queues=self.demand_queues, price_queue=self.price_queue_online
+                )
+                predicted_actual_demand_online = actual_demand_online
+                predicted_actual_variance_online = actual_variance_online
+
+            # 获取线下用户预定需求NGBoost预测（使用线下价格）
+            if ngboost_predictor_offline_booked is not None:
+                booked_demand_offline, booked_variance_offline = ngboost_predictor_offline_booked(
+                    date_features, action_offline, record_env_changes=True, user_type='offline', demand_type='booked',
+                    demand_queues=self.demand_queues, price_queue=self.price_queue_offline
+                )
+                predicted_booked_demand_offline = booked_demand_offline
+                predicted_booked_variance_offline = booked_variance_offline
+
+            # 获取线下用户实际需求NGBoost预测（使用线下价格）
+            if ngboost_predictor_offline_actual is not None:
+                actual_demand_offline, actual_variance_offline = ngboost_predictor_offline_actual(
+                    date_features, action_offline, record_env_changes=True, user_type='offline', demand_type='actual',
+                    demand_queues=self.demand_queues, price_queue=self.price_queue_offline
+                )
+                predicted_actual_demand_offline = actual_demand_offline
+                predicted_actual_variance_offline = actual_variance_offline
+
+        
+        # 线上用户需求采样
+        booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
+        actual_demand_online_sampled = max(0, int(np.random.normal(predicted_actual_demand_online, np.sqrt(predicted_actual_variance_online))))
+        
+        # 确保预定需求采样值大于实际需求采样值
+        while booked_demand_online_sampled <= actual_demand_online_sampled:
+            booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
+            actual_demand_online_sampled = max(0, int(np.random.normal(predicted_actual_demand_online, np.sqrt(predicted_actual_variance_online))))
+        
+        # 线下用户需求采样
+        booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
+        actual_demand_offline_sampled = max(0, int(np.random.normal(predicted_actual_demand_offline, np.sqrt(predicted_actual_variance_offline))))
+        
+        # 确保预定需求采样值大于实际需求采样值
+        while booked_demand_offline_sampled <= actual_demand_offline_sampled:
+            booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
+            actual_demand_offline_sampled = max(0, int(np.random.normal(predicted_actual_demand_offline, np.sqrt(predicted_actual_variance_offline))))
+        
+        # # 总预定需求 = 线上预定需求 + 线下预定需求
+        # predicted_booked_demand = predicted_booked_demand_online + predicted_booked_demand_offline
+        # # 总实际需求 = 线上实际需求 + 线下实际需求
+        # predicted_actual_demand = predicted_actual_demand_online + predicted_actual_demand_offline
+        # # 总预定方差 = 线上预定方差 + 线下预定方差（假设独立）
+        # predicted_booked_variance = predicted_booked_variance_online + predicted_booked_variance_offline
+        # # 总实际方差 = 线上实际方差 + 线下实际方差（假设独立）
+        # predicted_actual_variance = predicted_actual_variance_online + predicted_actual_variance_offline
+        
+        # 采样后的总需求
+        total_booked_demand_sampled = booked_demand_online_sampled + booked_demand_offline_sampled
+        total_actual_demand_sampled = actual_demand_online_sampled + actual_demand_offline_sampled
+        
+        # 更新4+1队列系统：将当前需求值和价格添加到队列中
+        self.demand_queues['online_booked'].appendleft(booked_demand_online_sampled)
+        self.demand_queues['online_actual'].appendleft(actual_demand_online_sampled)
+        self.demand_queues['offline_booked'].appendleft(booked_demand_offline_sampled)
+        self.demand_queues['offline_actual'].appendleft(actual_demand_offline_sampled)
+        self.price_queue.appendleft(price)  # 使用线上价格进行历史记录（兼容旧逻辑）
+        self.price_queue_online.appendleft(price_online)    # 记录线上价格
+        self.price_queue_offline.appendleft(price_offline)  # 记录线下价格
+        
+        # 分别计算线上线下用户的成交量（受库存限制）
+        current_original_inventory = self.initial_inventory
+        
+        # 优先满足线下用户（修改库存分配逻辑）
+        actual_bookings_offline = min(actual_demand_offline_sampled, current_original_inventory)
+        # 剩余库存
+        remaining_inventory = max(0, current_original_inventory - actual_bookings_offline)
+        # 线上用户成交量（基于剩余库存）
+        actual_bookings_online = min(actual_demand_online_sampled, remaining_inventory)
+        # 总成交量
+        actual_bookings = actual_bookings_online + actual_bookings_offline
+        
+        # 分别计算线上线下用户的当日收益（使用各自的价格）
+        # print(f"agent选择价格为{price},成本为{self.cost_per_room}")
+        
+        # 在成交确认后计算需求比例调整因子
+        # 分别计算线上线下用户的需求比例调整因子
+        demand_ratio_online = 1.0
+        # if booked_demand_online_sampled > self.initial_inventory:
+        #     demand_ratio_online = actual_demand_online_sampled / booked_demand_online_sampled if booked_demand_online_sampled > 0 else 1.0
+        
+        demand_ratio_offline = 1.0
+        # if booked_demand_offline_sampled > self.initial_inventory:
+        #     demand_ratio_offline = actual_demand_offline_sampled / booked_demand_offline_sampled if booked_demand_offline_sampled > 0 else 1.0
+        
+        # 总需求比例调整因子（用于历史记录）
+        demand_ratio = 1.0
+        # if total_booked_demand_sampled > self.initial_inventory:
+        #     demand_ratio = total_actual_demand_sampled / total_booked_demand_sampled if total_booked_demand_sampled > 0 else 1.0
+        
+        today_revenue_online = (price_online - self.cost_per_room) * actual_bookings_online * demand_ratio_online
+        today_revenue_offline = (price_offline - self.cost_per_room) * actual_bookings_offline * demand_ratio_offline
+        
+        # 总当日收益 = 线上当日收益 + 线下当日收益
+        today_revenue = today_revenue_online + today_revenue_offline
+        
+        # # 分别计算线上线下用户的未来预期收益
+        # future_expected_revenue_online = 0
+        # future_expected_revenue_offline = 0
+        # if self.beta_distribution and len(self.beta_distribution) > 1:
+        #     # β[1]到β[n-1]表示未来入住的比例
+        #     future_beta_sum = sum(self.beta_distribution[1:])
+        #     # 线上用户未来预期收益
+        #     future_expected_revenue_online = (price - self.cost_per_room) * booked_demand_online_sampled * future_beta_sum
+        #     # 线下用户未来预期收益
+        #     future_expected_revenue_offline = (price - self.cost_per_room) * booked_demand_offline_sampled * future_beta_sum
+        
+        # 总未来预期收益 = 线上未来收益 + 线下未来收益
+        # future_expected_revenue = future_expected_revenue_online + future_expected_revenue_offline
+        
+        # # 总收益 = 当日收益 + 未来预期收益
+        # total_revenue = today_revenue + future_expected_revenue
+
+        # 总收益 = 当日收益
+        total_revenue = today_revenue
+        # print(f"总收益{total_revenue}")
+        
+        # # 动态风险惩罚系数（按季节调整）
+        # if ngboost_predictor_online_booked is not None or ngboost_predictor_offline_booked is not None:
+        #     # 获取当前状态信息
+        #     state_info = self._get_state()
             
-            # 获取线下用户BNN预测
-            if bnn_predictor_offline is not None:
-                demand_offline, variance_offline = bnn_predictor_offline(date_features, action)
-                predicted_demand_offline = demand_offline
-                predicted_variance_offline = variance_offline
-        
-        # 总预测需求 = 线上预测需求 + 线下预测需求
-        predicted_demand = predicted_demand_online + predicted_demand_offline
-        # 总预测方差 = 线上预测方差 + 线下预测方差（假设独立）
-        predicted_variance = predicted_variance_online + predicted_variance_offline
-        
-        # 添加一些随机性到实际需求
-        actual_demand = max(0, int(np.random.normal(predicted_demand, np.sqrt(predicted_variance))))
-        # else:
-        #     # 如果没有BNN预测器，使用简单的需求模型
-        #     base_demand = 30
-        #     price_sensitivity = 0.3
-        #     actual_demand = max(0, int(base_demand * (1 - price_sensitivity * (price - 120) / 120)))
-        #     predicted_demand = actual_demand  # 没有预测器时，预测需求等于实际需求
-        #     predicted_variance = 10.0  # 默认方差
-        
-        # 成交量计算（受库存限制）- 使用原始库存
-        current_original_inventory = self.future_inventory[0] if self.future_inventory else self.current_inventory
-        actual_bookings = min(actual_demand, current_original_inventory)
-        
-        # 计算当日收益（当天入住的部分）
-        # 根据用户要求：当天是1*bnn的预测值，所以当日收益系数为1
-        today_revenue = (price - self.cost_per_room) * actual_bookings * 1.0
-        
-        # 计算未来入住带来的预期收益
-        # 根据β系数分布，计算未来各天的预期收益
-        future_expected_revenue = 0
-        if self.beta_distribution and len(self.beta_distribution) > 1:
-            # β[1]到β[n-1]表示未来入住的比例
-            future_beta_sum = sum(self.beta_distribution[1:])
-            # 根据用户要求：未来预期收益 = (价格-成本) × BNN预测值 × Σβ₁₋₄
-            future_expected_revenue = (price - self.cost_per_room) * predicted_demand * future_beta_sum
-        
-        # 总收益 = 当日收益 + 未来预期收益
-        total_revenue = today_revenue + future_expected_revenue
-        
-        # 动态风险惩罚系数（按季节调整）
-        if bnn_predictor_online is not None or bnn_predictor_offline is not None:
-            # 获取当前状态信息
-            state_info = self._get_state()
+        #     # 获取当前季节
+        #     season = state_info.get('season', 1)  # 默认为平季
             
-            # 获取当前季节
-            season = state_info.get('season', 1)  # 默认为平季
-            
-            # 按季节调整风险系数
-            if season == 2:  # 旺季
-                lambda_coef = 0.1
-            elif season == 0:  # 淡季
-                lambda_coef = 0.5
-            else:  # 平季
-                lambda_coef = 0.25
+        #     # 按季节调整风险系数
+        #     if season == 2:  # 旺季
+        #         lambda_coef = 0.1
+        #     elif season == 0:  # 淡季
+        #         lambda_coef = 0.5
+        #     else:  # 平季
+        #         lambda_coef = 0.25
                 
-            risk_penalty = lambda_coef * predicted_variance  
-        else:
-            risk_penalty = 0.0
+        #     risk_penalty = lambda_coef * predicted_actual_variance  
+        # else:
+        #     risk_penalty = 0.0
         
-        # 总奖励 = 总收益 - 风险惩罚
-        reward = total_revenue - risk_penalty
+        # # 总奖励 = 总收益 - 风险惩罚
+        # reward = total_revenue - risk_penalty
+
+        # 总奖励 = 总收益 (去除风险惩罚)
+        reward = total_revenue
         
         # 更新库存
         self._update_inventory(actual_bookings)
@@ -318,15 +471,24 @@ class HotelEnvironment:
         # 记录历史
         self.daily_history.append({
             'day': self.day,
-            'price': price,
-            'predicted_demand': predicted_demand if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else actual_demand,
-            'predicted_variance': predicted_variance if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else 0,
-            'actual_demand': actual_demand,
+            'price': price,  # 线上价格用于历史记录（兼容旧逻辑）
+            'price_online': price_online,  # 线上价格
+            'price_offline': price_offline,  # 线下价格
+            # 'predicted_booked_demand': predicted_booked_demand,
+            # 'predicted_booked_variance': predicted_booked_variance,
+            # 'predicted_actual_demand': predicted_actual_demand,
+            # 'predicted_actual_variance': predicted_actual_variance,
+            'actual_demand': total_actual_demand_sampled,
             'actual_bookings': actual_bookings,
+            'actual_bookings_online': actual_bookings_online,  # 新增：线上成交量
+            'actual_bookings_offline': actual_bookings_offline,  # 新增：线下成交量
+            'demand_ratio': demand_ratio,
             'inventory_before': self.current_inventory + actual_bookings,
             'inventory_after': self.current_inventory,
             'revenue': total_revenue,
-            'risk_penalty': risk_penalty,
+            'revenue_online': today_revenue_online,  # 新增：线上收益
+            'revenue_offline': today_revenue_offline,  # 新增：线下收益
+            # 'risk_penalty': risk_penalty,
             'reward': reward
         })
         
@@ -335,12 +497,25 @@ class HotelEnvironment:
         
         # 判断episode是否结束
         done = (self.day >= 90)  # 90天规划周期，不考虑库存耗尽
+
+        # print(f"{'-'*15}一个episode结束{'-'*15}")
         
         return new_state, reward, done, {
-            'predicted_demand': predicted_demand if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else actual_demand,
-            'predicted_variance': predicted_variance if (bnn_predictor_online is not None or bnn_predictor_offline is not None) else 0,
+            # 'predicted_booked_demand': predicted_booked_demand,
+            # 'predicted_booked_variance': predicted_booked_variance,
+            # 'predicted_actual_demand': predicted_actual_demand,
+            # 'predicted_actual_variance': predicted_actual_variance,
+            'actual_demand': total_actual_demand_sampled,
             'actual_bookings': actual_bookings,
-            'revenue': total_revenue
+            'actual_bookings_online': actual_bookings_online,
+            'actual_bookings_offline': actual_bookings_offline,
+            'demand_ratio': demand_ratio,
+            'revenue': total_revenue,
+            # 添加四个NGBoost预测器的详细预测结果
+            'predicted_booked_demand_online': predicted_booked_demand_online,
+            'predicted_actual_demand_online': predicted_actual_demand_online,
+            'predicted_booked_demand_offline': predicted_booked_demand_offline,
+            'predicted_actual_demand_offline': predicted_actual_demand_offline
         }
     
     def _update_inventory(self, bookings: int) -> None:
@@ -458,8 +633,10 @@ class QLearningAgent:
     - 状态编码：inventory_level × 6 + season × 2 + weekday
     
     动作空间：
-    - 总动作数：6（6个定价档位）
-    - 动作映射：0→60元，1→90元，2→120元，3→150元，4→180元，5→210元
+    - 总动作数：36（线上6档 × 线下6档）
+    - 动作映射：action_idx = online_idx * 6 + offline_idx
+    - 线上价格档位：[80, 90, 100, 110, 120, 130]元
+    - 线下价格档位：[90, 105, 120, 135, 150, 165]元
     
     学习参数：
     - 学习率：控制Q值更新速度
@@ -486,11 +663,16 @@ class QLearningAgent:
         - 状态离散化支持库存、季节、工作日类型组合
     """
     
-    def __init__(self, n_states: int = 30, n_actions: int = 6, learning_rate: float = 0.1, discount_factor: float = 0.9,
-                 epsilon_start: float = 0.9, epsilon_end: float = 0.1, epsilon_decay_steps: int = 50):
+    def __init__(self, n_states: int = 30, n_actions: int = None, learning_rate: float = 0.1, discount_factor: float = 0.9,
+                 epsilon_start: float = 0.8, epsilon_end: float = 0.01, epsilon_decay_steps: int = 50):
+        
+        # 如果未指定动作数，从配置文件读取
+        if n_actions is None:
+            from config import RL_CONFIG
+            n_actions = RL_CONFIG['n_actions']  # 36个动作组合（线上6价格 × 线下6价格）
         
         self.n_states = n_states
-        self.n_actions = n_actions
+        self.n_actions = n_actions  # 6×6=36个动作组合（线上6价格 × 线下6价格）
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
         self.epsilon_start = epsilon_start
@@ -510,11 +692,15 @@ class QLearningAgent:
         self.training_history = []
     
     def get_epsilon(self, episode: int) -> float:
-        """获取当前的epsilon值"""
+        """获取当前的epsilon值 - 使用更快的指数衰减策略"""
         if episode >= self.epsilon_decay_steps:
             return self.epsilon_end
         else:
-            return self.epsilon_start - (self.epsilon_start - self.epsilon_end) * episode / self.epsilon_decay_steps
+            # 使用更快的指数衰减策略，使探索率快速下降
+            # epsilon = epsilon_end + (epsilon_start - epsilon_end) * exp(-episode / decay_rate)
+            decay_rate = self.epsilon_decay_steps / 2  # 进一步加快衰减速率
+            epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * np.exp(-episode / decay_rate)
+            return epsilon
     
     def discretize_state(self, state_info: Dict[str, Any], season: int, weekday: int) -> int:
         """离散化状态 - 基于当前库存、季节和日期类型"""
@@ -529,14 +715,23 @@ class QLearningAgent:
         return min(state_index, self.n_states - 1)  # 防止越界
     
     def select_action(self, state: Union[List, np.ndarray, int], episode: int) -> int:
-        """选择动作（epsilon-greedy + UCB探索策略）"""
+        """选择动作（epsilon-greedy + 增强UCB探索策略）"""
         epsilon = self.get_epsilon(episode)
         state_key = tuple(state) if isinstance(state, (list, np.ndarray)) else state
         q_values = self.q_table[state_key]
         
+        # 36个动作组合：action_idx = online_idx * 6 + offline_idx
         if random.random() < epsilon:
-            # 探索：使用UCB策略选择访问次数最少的动作
+            # 增强探索策略：结合UCB和随机探索
             visit_counts = np.array([self.state_action_visit_count.get((state_key, a), 0) for a in range(self.n_actions)])
+            
+            # 如果存在完全未探索的动作（访问次数为0），优先选择这些动作
+            unvisited_actions = np.where(visit_counts == 0)[0]
+            if len(unvisited_actions) > 0:
+                # 如果有未探索的动作，随机选择一个
+                return random.choice(unvisited_actions)
+            
+            # 否则使用UCB策略选择访问次数最少的动作
             min_visits = np.min(visit_counts)
             least_visited_actions = np.where(visit_counts == min_visits)[0]
             
@@ -587,18 +782,20 @@ class QLearningAgent:
         
         return new_q
     
-    def train_episode(self, env: HotelEnvironment, online_bnn_predictor: Optional[Any] = None, offline_bnn_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, episode: int = 0) -> Tuple[float, int]:
+    def train_episode(self, env: HotelEnvironment, online_booked_predictor: Optional[Any] = None, online_actual_predictor: Optional[Any] = None, offline_booked_predictor: Optional[Any] = None, offline_actual_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, episode: int = 0) -> Tuple[float, int]:
         """
         训练一个episode（完整的酒店定价周期）
         
         功能描述：
         执行完整的酒店定价决策周期，从环境重置到episode结束，记录完整的训练和交互过程。
-        支持两个BNN预测器集成、多阶段收益计算、详细日志记录等功能。
+        支持四个NGBoost预测器集成（双需求模型）、多阶段收益计算、详细日志记录等功能。
         
         参数:
             env (HotelEnvironment): 酒店环境实例
-            online_bnn_predictor (Optional[Any]): 线上用户BNN预测器包装器
-            offline_bnn_predictor (Optional[Any]): 线下用户BNN预测器包装器
+            online_booked_predictor (Optional[Any]): 线上用户预定需求NGBoost预测器包装器
+            online_actual_predictor (Optional[Any]): 线上用户实际需求NGBoost预测器包装器
+            offline_booked_predictor (Optional[Any]): 线下用户预定需求NGBoost预测器包装器
+            offline_actual_predictor (Optional[Any]): 线下用户实际需求NGBoost预测器包装器
             date_features (Optional[pd.DataFrame]): 日期特征数据，包含季节、工作日等信息
             episode (int): 当前episode编号，用于控制探索率衰减
             
@@ -609,7 +806,7 @@ class QLearningAgent:
         1. 环境初始化：重置酒店环境到初始状态
         2. 状态获取：获取当前库存、季节、日期类型等状态信息
         3. 动作选择：基于ε-贪心策略选择定价动作
-        4. 环境交互：执行定价决策，使用两个BNN预测器获取奖励和下一状态
+        4. 环境交互：执行定价决策，使用四个NGBoost预测器获取奖励和下一状态
         5. Q表更新：使用Q-learning算法更新价值函数
         6. 数据记录：记录每日决策、奖励、库存变化等信息
         7. 循环执行：重复步骤3-6直到episode结束
@@ -617,7 +814,7 @@ class QLearningAgent:
         
         Note:
         - 支持最大200步限制，防止无限循环
-        - 集成两个BNN预测器分别预测线上和线下用户需求
+        - 集成四个NGBoost预测器分别预测线上/线下用户的预定/实际需求
         - 记录详细的每日决策信息用于后续分析
         - 使用episode计数器控制探索率衰减
         - 支持多阶段收益计算（当日收益+未来预期收益）
@@ -646,23 +843,28 @@ class QLearningAgent:
             # 选择动作
             action = self.select_action(state, episode)
             
-            # 获取价格信息
-            prices = [60, 90, 120, 150, 180, 210]
-            price = prices[action]
+            # 36个动作组合映射：action_idx = online_idx * 6 + offline_idx
+            online_idx = action // 6  # 线上价格索引 (0-5)
+            offline_idx = action % 6   # 线下价格索引 (0-5)
+            
+            online_prices = [80, 90, 100, 110, 120, 130]
+            offline_prices = [90, 105, 120, 135, 150, 165]
+            price_online = online_prices[online_idx]
+            price_offline = offline_prices[offline_idx]
+            price = price_online  # 使用线上价格进行历史记录
             
             # 获取当前库存（上一轮更新后的库存）
             current_inventory = state_info['inventory_raw']
             future_inventory = state_info.get('future_inventory', [])
             
-            # 执行动作，使用两个BNN预测器
-            next_state_info, reward, done, info = env.step(action, online_bnn_predictor, offline_bnn_predictor, date_features)
+            # 执行动作，使用四个NGBoost预测器
+            next_state_info, reward, done, info = env.step(action, online_booked_predictor, online_actual_predictor, offline_booked_predictor, offline_actual_predictor, date_features)
             
-            # 获取BNN预测的需求信息
+            # 获取NGBoost预测的需求信息
             predicted_demand = info.get('predicted_demand', 0)
             predicted_variance = info.get('predicted_variance', 0)
             actual_bookings = info.get('actual_bookings', 0)
             
-            # 打印动作、库存、BNN预测需求和奖励信息
             # 获取收益分解信息 - 使用正确的计算逻辑
             beta_0 = env.beta_distribution[0] if env.beta_distribution else 1.0
             today_revenue = (price - env.cost_per_room) * actual_bookings * 1
@@ -673,17 +875,19 @@ class QLearningAgent:
                 future_beta_sum = sum(env.beta_distribution[1:])  # β₁到β₄的和
                 future_expected_revenue = (price - env.cost_per_room) * predicted_demand * future_beta_sum
             
-            print(f"第{steps+1}天 - 动作: {action}({price}元), 当前库存: {current_inventory}, 更新后库存: {next_state_info['inventory_raw']}")
-            print(f"        BNN预测需求: {predicted_demand:.1f}±{np.sqrt(predicted_variance):.1f}, 实际预订: {actual_bookings}")
-            print(f"        当日收益: {today_revenue:.2f}元, 未来预期收益: {future_expected_revenue:.2f}元, 总奖励: {reward:.2f}")
-            
-            # 显示更新后的未来库存预测
-            updated_future_inventory = next_state_info.get('future_inventory', [])
-            if updated_future_inventory:
-                # 显示未来10天的库存预测（如果可用）
-                future_days = min(10, len(updated_future_inventory))
-                future_inventory_str = ", ".join([f"第{i+1}天:{inv}" for i, inv in enumerate(updated_future_inventory[:future_days])])
-                print(f"        更新后未来库存预测: [{future_inventory_str}]")
+            # # 减少详细输出，只在每10步或episode结束时显示
+            # if steps % 10 == 0 or done:
+                # print(f"第{steps+1}天 - 动作: {action}({price}元), 库存: {current_inventory}→{next_state_info['inventory_raw']}")
+                # 计算总的预测需求
+            #     total_predicted_booked_demand = info.get('predicted_booked_demand_online', 0) + info.get('predicted_booked_demand_offline', 0)
+            #     # 计算线上和线下的实际预订
+            #     total_predicted_actual_demand = info.get('predicted_actual_demand_online', 0) + info.get('predicted_actual_demand_offline', 0)
+            #     print(f"        预测需求: {total_predicted_booked_demand:.1f}, 实际预订: {actual_bookings}, 奖励: {reward:.2f}")
+            #     # 打印四个NGBoost预测器的详细预测结果
+            #     print(f"        线上预定预测: {info.get('predicted_booked_demand_online', 0):.1f}, 线上实际预测: {info.get('predicted_actual_demand_online', 0):.1f}")
+            #     print(f"        线下预定预测: {info.get('predicted_booked_demand_offline', 0):.1f}, 线下实际预测: {info.get('predicted_actual_demand_offline', 0):.1f}")
+            #     # 打印实际预订的分解
+            #     print(f"        线上实际预订: {info.get('actual_bookings_online', 0):.1f}, 线下实际预订: {info.get('actual_bookings_offline', 0):.1f}")
             
             # 离散化下一个状态
             next_state = self.discretize_state(next_state_info, season, weekday)
@@ -745,7 +949,7 @@ class QLearningAgent:
         Note:
         - 返回确定性策略（贪婪策略）
         - 如果Q表为空，返回空字典
-        - 动作为0-5的整数，对应6个定价档位
+        - 动作为0-7的整数，对应8个定价档位
         """
         policy = {}
         for state, q_values in self.q_table.items():
@@ -907,23 +1111,23 @@ class QLearningAgent:
         
         print(f"智能体已从{filepath}加载")
 
-class BNNPredictorWrapper:
+class NGBoostPredictorWrapper:
     """
-    BNN预测器包装器 - 贝叶斯神经网络预测接口
+    NGBoost预测器包装器 - 自然梯度提升预测接口
     
     功能描述：
-    为强化学习系统提供标准化的BNN预测接口，处理特征准备、预测调用、结果反标准化等流程。
+    为强化学习系统提供标准化的NGBoost预测接口，处理特征准备、预测调用、结果反标准化等流程。
     支持单次预测和批量预测，集成需求标准化器进行数据预处理和后处理。
     
     主要特性：
     - 特征标准化：自动处理输入特征的标准化
-    - 预测包装：统一BNN预测调用接口  
+    - 预测包装：统一NGBoost预测调用接口  
     - 结果反标准化：将预测结果转换回原始尺度
     - 维度检查：确保输入输出维度正确性
     - 异常处理：处理预测过程中的各种边界情况
     
     Attributes:
-        bnn_trainer (Any): BNN训练器实例，包含预测功能
+        ngboost_trainer (Any): NGBoost训练器实例，包含预测功能
         preprocessor (Any): 预处理器，用于特征准备和标准化
         demand_scaler (Optional[Any]): 需求标准化器，用于反标准化预测结果
         
@@ -934,47 +1138,146 @@ class BNNPredictorWrapper:
         - 提供简洁的__call__接口便于使用
     """
     
-    def __init__(self, bnn_trainer: Any, preprocessor: Any, demand_scaler: Optional[Any] = None):
-        self.bnn_trainer = bnn_trainer
+    def __init__(self, ngboost_trainer: Any, preprocessor: Any, demand_scaler: Optional[Any] = None):
+        self.ngboost_trainer = ngboost_trainer
         self.preprocessor = preprocessor
         self.demand_scaler = demand_scaler
     
-    def __call__(self, date_features: pd.DataFrame, action: int) -> Tuple[float, float]:
+    def prepare_features_from_queues(self, date_features: pd.DataFrame, action: int, 
+                                     demand_queues: dict, price_queue: deque, 
+                                     user_type: str, demand_type: str) -> torch.Tensor:
         """
-        调用BNN预测器进行需求预测
+        从队列数据准备NGBoost模型的输入特征
+        
+        使用4个需求队列和1个价格队列计算6个核心特征：
+        1. 价格（当前定价动作对应的价格）
+        2. 是否周末（从date_features获取）
+        3. 季节特征（从date_features获取）
+        4. 价格变异系数（基于价格队列计算）
+        5. 需求趋势（基于对应需求队列的7天数据线性回归斜率）
+        6. 价格趋势（基于价格队列的7天数据线性回归斜率）
+        
+        Args:
+            date_features (pd.DataFrame): 日期特征数据
+            action (int): 定价动作索引
+            demand_queues (dict): 4个需求队列的字典
+            price_queue (deque): 价格队列
+            user_type (str): 用户类型（'online'或'offline'）
+            demand_type (str): 需求类型（'booked'或'actual'）
+            
+        Returns:
+            torch.Tensor: 6维特征张量
+        """
+        # 1. 价格特征 - 使用当前定价动作对应的价格
+        price_levels = [60, 80, 100, 110, 120, 130, 140, 150]  # 8个价格档位（基于真实数据分布优化）
+        # 原配置: [60, 90, 120, 150, 180, 210] - 高价位缺乏数据支持
+        # 新配置基于数据分析:
+        # - 线上价格范围: 93.61-115.91元
+        # - 线下价格范围: 99.96-152.80元  
+        # - 90%的数据在150元以下
+        price = float(price_levels[action])
+        
+        # 2. 是否周末特征
+        if 'is_weekend' in date_features.columns:
+            is_weekend = float(date_features['is_weekend'].iloc[0])
+        else:
+            is_weekend = 0.0  # 默认工作日
+        
+        # 3. 季节特征
+        if 'season' in date_features.columns:
+            season = float(date_features['season'].iloc[0])
+        else:
+            season = 1.0  # 默认平季
+        
+        # 4. 价格变异系数 - 基于价格队列计算
+        if len(price_queue) >= 2:
+            price_array = np.array(list(price_queue))
+            price_cv = float(np.std(price_array) / np.mean(price_array) if np.mean(price_array) > 0 else 0.1)
+        else:
+            price_cv = 0.1  # 默认价格变异系数
+        
+        # 5. 需求趋势 - 基于对应需求队列的7天数据线性回归斜率
+        queue_key = f"{user_type}_{demand_type}"
+        if queue_key in demand_queues and len(demand_queues[queue_key]) >= 2:
+            demand_array = np.array(list(demand_queues[queue_key]))
+            x = np.arange(len(demand_array))
+            slope, _ = np.polyfit(x, demand_array, 1)
+            demand_trend = float(slope)
+        else:
+            demand_trend = 0.0  # 默认无趋势
+        
+        # 6. 价格趋势 - 基于价格队列的7天数据线性回归斜率
+        if len(price_queue) >= 2:
+            price_array = np.array(list(price_queue))
+            x = np.arange(len(price_array))
+            slope, _ = np.polyfit(x, price_array, 1)
+            price_trend = float(slope)
+        else:
+            price_trend = 0.0  # 默认无趋势
+        
+        # 组合特征 [价格, 是否周末, 季节, 价格变异系数, 需求趋势, 价格趋势]
+        features = [price, is_weekend, season, price_cv, demand_trend, price_trend]
+        
+        return torch.FloatTensor(features)
+    
+    def __call__(self, date_features: pd.DataFrame, action: int, record_env_changes: bool = False, 
+                 user_type: str = None, demand_type: str = None, demand_queues: dict = None, 
+                 price_queue: deque = None) -> Tuple[float, float]:
+        """
+        调用NGBoost预测器进行需求预测，支持环境变化记录和队列数据特征计算
         
         功能描述：
-        执行完整的BNN预测流程：特征准备 → BNN预测 → 结果反标准化，返回预测需求的均值和方差。
+        执行完整的NGBoost预测流程：特征准备 → NGBoost预测 → 结果反标准化，返回预测需求的均值和方差。
+        现在支持从队列数据计算特征，替代原有的特征准备方法。
         
         参数:
             date_features (pd.DataFrame): 日期特征数据，包含季节、工作日等信息
             action (int): 定价动作索引（0-5，对应6个价格档位）
+            record_env_changes (bool): 是否记录环境变化，默认False
+            user_type (str): 用户类型（'online'或'offline'）
+            demand_type (str): 需求类型（'booked'或'actual'）
+            demand_queues (dict): 4个需求队列的字典
+            price_queue (deque): 价格队列
             
         返回值:
-            Tuple[float, float]: (预测需求均值, 预测方差) - BNN的预测结果
+            Tuple[float, float]: (预测需求均值, 预测方差) - NGBoost的预测结果
             
         预测流程:
-        1. 特征准备：使用预处理器准备BNN输入特征
-        2. 维度检查：确保特征维度正确（3维：[季节, 是否周末, 价格]）
+        1. 特征准备：使用队列数据准备NGBoost输入特征
+        2. 维度检查：确保特征维度正确（6维：[季节, 是否周末, 平均价格, 价格变异系数, 需求趋势, 价格趋势]）
         3. 批次处理：为单样本预测添加批次维度
-        4. BNN预测：调用训练器进行需求预测
+        4. NGBoost预测：调用训练器进行需求预测，支持环境变化记录
         5. 反标准化：如有标准化器，将结果转换回原始尺度
         
         Note:
-        - 输入特征维度必须为3（季节、工作日类型、价格）
+        - 输入特征维度必须为6（季节、工作日类型、平均价格、价格变异系数、需求趋势、价格趋势）
         - 自动处理PyTorch张量的维度调整
         - 支持需求标准化器的反变换
         - 方差按标准化器尺度的平方进行缩放
+        - 支持环境变化记录，记录预测结果作为环境状态变化
         """
-        # 准备特征 - 只使用季节、工作日/周末、价格三个特征
-        features = self.preprocessor.prepare_bnn_features(date_features, action)
+        # 准备特征 - 使用队列数据计算6个核心特征
+        if demand_queues is not None and price_queue is not None:
+            features = self.prepare_features_from_queues(date_features, action, demand_queues, price_queue, user_type, demand_type)
+        else:
+            # 降级到原有方法（向后兼容）
+            features = self.preprocessor.prepare_ngboost_features(date_features, action)
         
-        # 确保特征维度正确（3维：[季节, 是否周末, 价格]）
-        if features.dim() == 1 and features.shape[0] == 3:
-            features = features.unsqueeze(0)  # 添加批次维度
+        # 确保特征维度正确（6维：[季节, 是否周末, 平均价格, 价格变异系数, 需求趋势, 价格趋势]）
+        if hasattr(features, 'dim'):
+            # PyTorch张量
+            if features.dim() == 1 and features.shape[0] == 6:
+                features = features.unsqueeze(0)  # 添加批次维度
+        else:
+            # NumPy数组
+            if len(features.shape) == 1 and features.shape[0] == 6:
+                features = features.reshape(1, -1)  # 添加批次维度
         
-        # 预测
-        mean_pred, var_pred = self.bnn_trainer.predict_single(features)
+        # 预测，传递环境变化记录参数
+        mean_pred, var_pred = self.ngboost_trainer.predict_single(
+            features, record_env_changes=record_env_changes, 
+            user_type=user_type, demand_type=demand_type
+        )
         
         # 如果有标准化器，反标准化结果
         if self.demand_scaler is not None:
@@ -985,14 +1288,14 @@ class BNNPredictorWrapper:
 
 class HotelRLSystem:
     """
-    酒店强化学习系统 - 集成BNN预测的完整RL解决方案
+    酒店强化学习系统 - 集成NGBoost预测的完整RL解决方案
     
     功能描述：
-    构建完整的酒店动态定价强化学习系统，集成贝叶斯神经网络预测、Q-learning算法、
+    构建完整的酒店动态定价强化学习系统，集成自然梯度提升预测、Q-learning算法、
     在线学习等核心功能，提供从离线预训练到在线优化的端到端解决方案。
     
     系统架构：
-    - BNN预测器：提供需求预测和不确定性估计
+    - NGBoost预测器：提供需求预测和不确定性估计
     - Q-learning智能体：学习最优定价策略
     - 酒店环境：模拟真实的酒店运营环境
     - 训练监控器：跟踪训练进度和性能指标
@@ -1005,35 +1308,59 @@ class HotelRLSystem:
     - 多阶段训练：支持渐进式学习策略
     
     Attributes:
-        bnn_trainer (Any): BNN训练器实例，提供需求预测功能
+        ngboost_trainer (Any): NGBoost训练器实例，提供需求预测功能
         preprocessor (Any): 数据预处理器，处理特征工程
-        bnn_predictor (BNNPredictorWrapper): BNN预测器包装器
+        ngboost_predictor (NGBoostPredictorWrapper): NGBoost预测器包装器
         agent (QLearningAgent): Q-learning智能体
         env (HotelEnvironment): 酒店环境模拟器
         
     Note:
-        - 系统集成BNN预测和强化学习
+        - 系统集成NGBoost预测和强化学习
         - 支持增量学习和模型更新
         - 提供完整的训练监控和评估功能
         - 支持90天的完整定价周期模拟
     """
     
-    def __init__(self, online_bnn_trainer: Any, offline_bnn_trainer: Any, preprocessor: Any, 
-                 online_demand_scaler: Optional[Any] = None, offline_demand_scaler: Optional[Any] = None,
+    def __init__(self, ngboost_trainers: Dict[str, Any], preprocessor: Any, 
+                 demand_scalers: Dict[str, Any],
                  epsilon_start: float = 0.9, epsilon_end: float = 0.1, epsilon_decay_episodes: int = 400,
                  use_bayesian_rl: bool = False) -> None:
-        self.online_bnn_trainer = online_bnn_trainer
-        self.offline_bnn_trainer = offline_bnn_trainer
+        """
+        初始化酒店强化学习系统 - 支持双需求模型（预定需求和实际需求）
+        
+        Args:
+            ngboost_trainers: 包含四个NGBoost训练器的字典
+                - 'online_booked': 线上预定需求模型
+                - 'online_actual': 线上实际需求模型
+                - 'offline_booked': 线下预定需求模型
+                - 'offline_actual': 线下实际需求模型
+            preprocessor: 数据预处理器
+            demand_scalers: 包含四个标准化器的字典
+                - 'online_booked': 线上预定需求标准化器
+                - 'online_actual': 线上实际需求标准化器
+                - 'offline_booked': 线下预定需求标准化器
+                - 'offline_actual': 线下实际需求标准化器
+            epsilon_start: 初始探索率
+            epsilon_end: 最终探索率
+            epsilon_decay_episodes: 探索率衰减episode数
+            use_bayesian_rl: 是否使用贝叶斯Q-learning
+        """
+        self.ngboost_trainers = ngboost_trainers
         self.preprocessor = preprocessor
-        self.online_bnn_predictor = BNNPredictorWrapper(online_bnn_trainer, preprocessor, online_demand_scaler)
-        self.offline_bnn_predictor = BNNPredictorWrapper(offline_bnn_trainer, preprocessor, offline_demand_scaler)
+        self.demand_scalers = demand_scalers
+        
+        # 创建四个NGBoost预测器包装器
+        self.online_booked_predictor = NGBoostPredictorWrapper(ngboost_trainers['online_booked'], preprocessor, demand_scalers['online_booked'])
+        self.online_actual_predictor = NGBoostPredictorWrapper(ngboost_trainers['online_actual'], preprocessor, demand_scalers['online_actual'])
+        self.offline_booked_predictor = NGBoostPredictorWrapper(ngboost_trainers['offline_booked'], preprocessor, demand_scalers['offline_booked'])
+        self.offline_actual_predictor = NGBoostPredictorWrapper(ngboost_trainers['offline_actual'], preprocessor, demand_scalers['offline_actual'])
         
         # 根据配置选择使用标准Q-learning还是贝叶斯Q-learning
         if use_bayesian_rl:
             print("使用贝叶斯Q-learning算法")
             self.agent = BayesianQLearning(
                 n_states=30,  # 状态数：库存等级(5) × 季节(3) × 日期类型(2) = 30
-                n_actions=6,  # 动作数：6个价格档位
+                n_actions=8,  # 动作数：8个价格档位（与价格档位保持一致）
                 discount_factor=BQL_CONFIG['discount_factor'],
                 observation_noise_var=BQL_CONFIG['observation_noise_var'],
                 prior_mean=BQL_CONFIG['prior_mean'],
@@ -1042,20 +1369,22 @@ class HotelRLSystem:
         else:
             print("使用标准Q-learning算法")
             self.agent = QLearningAgent(
+                n_actions=36,  # 动作数：36个价格组合（线上6价格 × 线下6价格）
                 epsilon_start=epsilon_start,
                 epsilon_end=epsilon_end,
                 epsilon_decay_steps=epsilon_decay_episodes
             )
         
-        self.env = HotelEnvironment()
+        self.env = HotelEnvironment(initial_inventory=226)
     
     def offline_pretraining(self, features_df: pd.DataFrame, episodes: int = 1000) -> None:
         """
-        离线预训练 - 使用历史数据训练初始定价策略
+        离线预训练 - 使用历史数据训练初始定价策略（支持双需求模型）
         
         功能描述：
         使用历史酒店数据对Q-learning智能体进行离线预训练，通过大量episode学习基本的定价策略。
         集成训练监控器记录训练过程，支持随机日期选择和动态episode调整。
+        现在支持四个NGBoost预测器：线上预定需求、线上实际需求、线下预定需求、线下实际需求。
         
         参数:
             features_df (pd.DataFrame): 历史特征数据，包含日期、季节、需求等特征
@@ -1065,7 +1394,7 @@ class HotelRLSystem:
         1. 数据验证：检查特征数据是否满足最小天数要求
         2. Episode循环：运行指定数量的训练episode
         3. 随机采样：为每个episode随机选择起始日期
-        4. 智能体训练：调用train_episode进行单episode训练
+        4. 智能体训练：调用train_episode进行单episode训练（使用四个预测器）
         5. 指标记录：记录平均奖励、探索率、Q值统计等指标
         6. 进度显示：每10个episode显示训练进度
         7. 模型保存：训练完成后保存预训练模型
@@ -1084,6 +1413,7 @@ class HotelRLSystem:
         - 集成详细的训练过程监控
         - 保存预训练模型供后续使用
         - 提供完整的训练可视化报告
+        - 使用四个预测器：线上预定需求、线上实际需求、线下预定需求、线下实际需求
         """
         print("开始离线预训练...")
         
@@ -1112,9 +1442,15 @@ class HotelRLSystem:
             if len(episode_features) < 2:  # 至少需要2天数据
                 continue
                 
-            # 训练一个episode，使用两个BNN预测器
+            # 训练一个episode，使用四个NGBoost预测器（双需求模型）
             total_reward, steps = self.agent.train_episode(
-                self.env, self.online_bnn_predictor, self.offline_bnn_predictor, episode_features, episode
+                env=self.env, 
+                online_booked_predictor=self.online_booked_predictor,
+                online_actual_predictor=self.online_actual_predictor,
+                offline_booked_predictor=self.offline_booked_predictor,
+                offline_actual_predictor=self.offline_actual_predictor,
+                date_features=episode_features,
+                episode=episode
             )
             
             # 记录训练指标
@@ -1166,10 +1502,11 @@ class HotelRLSystem:
     
     def online_learning(self, features_df: pd.DataFrame, days: int = 90, update_frequency: int = 7) -> Dict[str, float]:
         """
-        在线学习 - 增量更新策略和BNN模型
+        在线学习 - 增量更新策略和BNN模型（支持双需求模型）
         
         功能描述：
         在真实环境中进行在线学习，根据实际交互数据持续优化Q-learning策略和BNN预测模型。
+        现在支持四个NGBoost预测器：线上预定需求、线上实际需求、线下预定需求、线下实际需求。
         
         参数:
             features_df (pd.DataFrame): 在线特征数据，按天提供新的环境信息
@@ -1187,10 +1524,10 @@ class HotelRLSystem:
         2. 每日循环：对每一天执行定价决策和学习
         3. 状态获取：获取当前库存、季节、日期类型等状态
         4. 动作选择：基于当前策略选择定价动作（低探索率）
-        5. 环境交互：执行定价决策，获取实际反馈
+        5. 环境交互：执行定价决策，获取实际反馈（使用四个预测器）
         6. 数据收集：收集有意义的交互数据用于增量学习
         7. Q表更新：使用实际经验更新Q值函数
-        8. BNN更新：定期使用新数据增量更新BNN模型
+        8. BNN更新：定期使用新数据增量更新BNN模型（支持四个模型）
         9. 进度显示：定期显示学习进度和关键指标
         10. 模型保存：学习完成后保存最终模型
         
@@ -1200,6 +1537,7 @@ class HotelRLSystem:
         - 提供详细的学习进度监控和统计信息
         - 自动处理episode结束和环境重置
         - 支持长达90天的完整在线学习周期
+        - 使用四个预测器：线上预定需求、线上实际需求、线下预定需求、线下实际需求
         """
         print("开始在线学习...")
         
@@ -1222,16 +1560,19 @@ class HotelRLSystem:
             # 在线学习时主要利用已有知识，少量探索
             action = self.agent.select_action(state, episode_counter)
             
-            # 执行动作并获取反馈，使用两个BNN预测器
+            # 执行动作并获取反馈，使用四个NGBoost预测器（双需求模型）
             next_state_info, reward, done, info = self.env.step(
-                action, self.online_bnn_predictor, self.offline_bnn_predictor, day_features
+                action, 
+                self.online_booked_predictor, self.online_actual_predictor,
+                self.offline_booked_predictor, self.offline_actual_predictor, 
+                day_features
             )
             
             # 原条件: if info['actual_bookings'] > 0
             # 新条件: 只要有预测需求或实际预订就收集
             if info['predicted_demand'] > 0 or info['actual_bookings'] > 0:
                 # 准备特征
-                features = self.preprocessor.prepare_bnn_features(day_features, action)
+                features = self.preprocessor.prepare_ngboost_features(day_features, action)
                 
                 incremental_data.append({
                     'features': features.unsqueeze(0).cpu().numpy().flatten(),
@@ -1240,7 +1581,7 @@ class HotelRLSystem:
                     'predicted_variance': info['predicted_variance'],
                     'day': day,
                     'action': action,
-                    'price': info.get('price', [60, 90, 120, 150, 180, 210][action]),
+                    'price': info.get('price', [60, 80, 100, 110, 120, 130, 140, 150][action]),
                     'reward': reward
                 })
             
@@ -1250,15 +1591,25 @@ class HotelRLSystem:
             
             
             if (day + 1) % update_frequency == 0 and len(incremental_data) >= 10:
-                print(f"第{day + 1}天：开始增量更新BNN...")
+                print(f"第{day + 1}天：开始增量更新NGBoost...")
                 
                 # 使用最近的数据，确保有足够样本
                 recent_data = incremental_data[-max(50, len(incremental_data)//2):]
                 X_new = np.array([d['features'] for d in recent_data])
                 y_new = np.array([d['target'] for d in recent_data])
                 
-                # 增量更新
-                self.bnn_trainer.incremental_update(X_new, y_new, epochs=5)
+                # 增量更新四个NGBoost模型
+                print("增量更新线上预定需求模型...")
+                self.ngboost_trainers['online_booked'].incremental_update(X_new, y_new, epochs=5)
+                
+                print("增量更新线上实际需求模型...")
+                self.ngboost_trainers['online_actual'].incremental_update(X_new, y_new, epochs=5)
+                
+                print("增量更新线下预定需求模型...")
+                self.ngboost_trainers['offline_booked'].incremental_update(X_new, y_new, epochs=5)
+                
+                print("增量更新线下实际需求模型...")
+                self.ngboost_trainers['offline_actual'].incremental_update(X_new, y_new, epochs=5)
                 
                 print(f"增量更新完成，使用{len(X_new)}条新数据")
             
@@ -1268,7 +1619,7 @@ class HotelRLSystem:
                 recent_rewards = [d['reward'] for d in incremental_data[-10:]] if incremental_data else [0]
                 
                 print(f"第{day + 1}天：库存: {state_info['inventory_raw']}, "
-                      f"价格: {[60, 90, 120, 150, 180, 210][action]}元, "
+                      f"价格: {[60, 80, 100, 110, 120, 130, 140, 150][action]}元, "
                       f"预订: {info['actual_bookings']}, "
                       f"预测需求: {info['predicted_demand']:.1f}, "
                       f"当日奖励: {reward:.2f}, "
@@ -1287,7 +1638,12 @@ class HotelRLSystem:
         
         # 保存最终模型
         self.agent.save_agent('../02_训练模型/q_agent_final.pkl')
-        self.bnn_trainer.save_model('../02_训练模型/bnn_model_final.pth')
+        
+        # 保存四个NGBoost模型
+        self.ngboost_trainers['online_booked'].save_model('../02_训练模型/ngboost_model_online_booked_final.pkl')
+        self.ngboost_trainers['online_actual'].save_model('../02_训练模型/ngboost_model_online_actual_final.pkl')
+        self.ngboost_trainers['offline_booked'].save_model('../02_训练模型/ngboost_model_offline_booked_final.pkl')
+        self.ngboost_trainers['offline_actual'].save_model('../02_训练模型/ngboost_model_offline_actual_final.pkl')
         
         # 返回详细的统计信息
         stats = self.env.get_statistics()
@@ -1295,6 +1651,35 @@ class HotelRLSystem:
         stats['avg_incremental_reward'] = np.mean([d['reward'] for d in incremental_data]) if incremental_data else 0
         
         return stats
+    
+    def bnn_predictor(self, day_features: pd.DataFrame, action: int) -> Tuple[float, float]:
+        """
+        BNN预测器接口 - 用于模拟函数获取预测需求和方差
+        
+        功能描述：
+        为run_simulation函数提供统一的预测接口，综合四个NGBoost预测器的结果
+        返回总预测需求和预测方差。
+        
+        Args:
+            day_features (pd.DataFrame): 当天的特征数据
+            action (int): 价格动作索引 (0-5)
+            
+        Returns:
+            Tuple[float, float]: (总预测需求, 总预测方差)
+        """
+        # 使用四个预测器获取预测结果
+        online_booked_pred, online_booked_var = self.online_booked_predictor(day_features, action)
+        online_actual_pred, online_actual_var = self.online_actual_predictor(day_features, action)
+        offline_booked_pred, offline_booked_var = self.offline_booked_predictor(day_features, action)
+        offline_actual_pred, offline_actual_var = self.offline_actual_predictor(day_features, action)
+        
+        # 计算总预测需求（预定需求 + 实际需求）
+        total_predicted_demand = online_booked_pred + offline_booked_pred + online_actual_pred + offline_actual_pred
+        
+        # 计算总预测方差（方差相加）
+        total_predicted_variance = online_booked_var + offline_booked_var + online_actual_var + offline_actual_var
+        
+        return total_predicted_demand, total_predicted_variance
     
     def evaluate_policy(self, features_df: pd.DataFrame, n_episodes: int = 10, verbose: bool = False) -> Tuple[pd.Series, List[Dict[str, float]]]:
         """
@@ -1363,9 +1748,12 @@ class HotelRLSystem:
                 q_values = self.agent.q_table[state]
                 action = np.argmax(q_values)
                 
-                # 执行动作
+                # 执行动作，使用四个NGBoost预测器（双需求模型）
                 _, reward, done, info = self.env.step(
-                    action, self.bnn_predictor, day_features
+                    action, 
+                    self.online_booked_predictor, self.online_actual_predictor,
+                    self.offline_booked_predictor, self.offline_actual_predictor, 
+                    day_features
                 )
                 
                 if done:
@@ -1417,7 +1805,7 @@ class BayesianQLearning:
     更新过程使用贝叶斯推断，结合先验信念和观测证据来更新后验分布。
     """
     
-    def __init__(self, n_states: int = 30, n_actions: int = 6, discount_factor: float = 0.9,
+    def __init__(self, n_states: int = 30, n_actions: int = 8, discount_factor: float = 0.9,
                  observation_noise_var: float = 1.0, prior_mean: float = 0.0, prior_var: float = 10.0,
                  q_value_max: float = 1000.0, reward_scale: float = 0.1):
         """
@@ -1826,16 +2214,19 @@ class BayesianQLearning:
         self.discount_factor = agent_state['discount_factor']
         self.observation_noise_var = agent_state['observation_noise_var']
     
-    def train_episode(self, env: HotelEnvironment, online_bnn_predictor: Optional[Any] = None, 
-                     offline_bnn_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, 
+    def train_episode(self, env: HotelEnvironment, online_booked_predictor: Optional[Any] = None, 
+                     online_actual_predictor: Optional[Any] = None, offline_booked_predictor: Optional[Any] = None, 
+                     offline_actual_predictor: Optional[Any] = None, date_features: Optional[pd.DataFrame] = None, 
                      episode: int = 0, exploration_strategy: str = "ucb") -> Tuple[float, int]:
         """
         使用贝叶斯Q-Learning训练一个episode
         
         Args:
             env: 酒店环境实例
-            online_bnn_predictor: 线上用户BNN预测器
-            offline_bnn_predictor: 线下用户BNN预测器  
+            online_booked_predictor: 线上用户预定需求NGBoost预测器
+            online_actual_predictor: 线上用户实际需求NGBoost预测器
+            offline_booked_predictor: 线下用户预定需求NGBoost预测器
+            offline_actual_predictor: 线下用户实际需求NGBoost预测器
             date_features: 日期特征数据
             episode: 当前episode编号
             exploration_strategy: 探索策略
@@ -1868,11 +2259,11 @@ class BayesianQLearning:
             action = self.select_action(state, episode, exploration_strategy)
             
             # 获取价格信息
-            prices = [60, 90, 120, 150, 180, 210]
+            prices = [60, 80, 100, 110, 120, 130, 140, 150]
             price = prices[action]
             
-            # 执行动作
-            next_state_info, reward, done, info = env.step(action, online_bnn_predictor, offline_bnn_predictor, date_features)
+            # 执行动作，使用四个NGBoost预测器
+            next_state_info, reward, done, info = env.step(action, online_booked_predictor, online_actual_predictor, offline_booked_predictor, offline_actual_predictor, date_features)
             
             # 获取当前状态的不确定性
             current_uncertainty = self.get_uncertainty(state, action)
@@ -1925,24 +2316,26 @@ class BayesianQLearning:
 if __name__ == "__main__":
     print("正在测试强化学习系统...")
     
-    # 创建模拟的BNN训练器
-    from bnn_model import BNNTrainer
+    # 设置随机种子 - 可取消注释以启用固定随机因子
+    # np.random.seed(42)
+    
+    # 创建模拟的NGBoost训练器
+    from ngboost_model import NGBoostTrainer
     
     # 创建模拟数据
-    np.random.seed(42)
     n_samples = 1000
     input_dim = 33
     
     X = np.random.randn(n_samples, input_dim).astype(np.float32)
     y = np.abs(2 * X[:, 0] + np.random.normal(0, 0.1, n_samples)) + 1
     
-    # 训练BNN
-    bnn_trainer = BNNTrainer(input_dim=input_dim)
-    bnn_trainer.train(X, y, epochs=20, save_path='../02_训练模型/bnn_model_rl_test.pth')
+    # 训练NGBoost
+    ngboost_trainer = NGBoostTrainer(input_dim=input_dim)
+    ngboost_trainer.train(X, y, epochs=20, save_path='../02_训练模型/ngboost_model_rl_test.pkl')
     
     # 创建预处理器（模拟）
     class MockPreprocessor:
-        def prepare_bnn_features(self, date_features, action):
+        def prepare_ngboost_features(self, date_features, action):
             return torch.FloatTensor(np.random.randn(1, input_dim).astype(np.float32))
     
     preprocessor = MockPreprocessor()
@@ -1952,7 +2345,7 @@ if __name__ == "__main__":
     demand_scaler = joblib.load('../02_训练模型/demand_scaler.pkl')
 
     # 创建RL系统
-    rl_system = HotelRLSystem(bnn_trainer, preprocessor, demand_scaler)
+    rl_system = HotelRLSystem(ngboost_trainer, preprocessor, demand_scaler)
     
     # 创建模拟的特征数据
     dates = pd.date_range('2017-01-01', periods=100, freq='D')

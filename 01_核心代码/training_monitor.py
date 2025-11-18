@@ -20,7 +20,7 @@ class TrainingMonitor:
     """
     训练过程监控器
     
-    全面记录和可视化强化学习训练过程中的关键指标，包括BNN训练、RL训练、
+    全面记录和可视化强化学习训练过程中的关键指标，包括NGBoost训练、RL训练、
     在线学习等各个阶段的性能指标。
     
     主要功能：
@@ -40,9 +40,9 @@ class TrainingMonitor:
     
     Attributes:
         save_dir (str): 保存目录路径
-        bnn_train_losses (List[float]): BNN训练损失历史
-        bnn_val_losses (List[float]): BNN验证损失历史
-        bnn_epochs (List[int]): BNN训练轮次
+        bnn_train_losses (List[float]): NGBoost训练损失历史
+        bnn_val_losses (List[float]): NGBoost验证损失历史
+        bnn_epochs (List[int]): NGBoost训练轮次
         rl_episode_rewards (List[float]): RL轮次平均奖励
         rl_episode_lengths (List[int]): RL轮次长度
         rl_exploration_rates (List[float]): 探索率变化
@@ -74,9 +74,9 @@ class TrainingMonitor:
         os.makedirs(save_dir, exist_ok=True)
         
         # 训练指标存储
-        self.bnn_train_losses = []  # BNN训练损失
-        self.bnn_val_losses = []    # BNN验证损失
-        self.bnn_epochs = []        # BNN训练轮次
+        self.bnn_train_losses = []  # NGBoost训练损失
+        self.bnn_val_losses = []    # NGBoost验证损失
+        self.bnn_epochs = []        # NGBoost训练轮次
         
         self.rl_episode_rewards = []      # RL每轮平均奖励
         self.rl_episode_lengths = []      # RL每轮长度
@@ -96,9 +96,9 @@ class TrainingMonitor:
         
     def record_bnn_epoch(self, epoch: int, train_loss: float, val_loss: Optional[float] = None) -> None:
         """
-        记录BNN训练轮次指标
+        记录NGBoost训练轮次指标
         
-        将BNN训练的轮次信息、训练损失和可选的验证损失记录到对应列表中。
+        将NGBoost训练的轮次信息、训练损失和可选的验证损失记录到对应列表中。
         
         Args:
             epoch (int): 训练轮次编号
@@ -132,6 +132,7 @@ class TrainingMonitor:
             - Q值统计信息包含Q值的最大值、最小值、平均值等
             - 探索率用于监控epsilon衰减策略
             - 所有指标按时间顺序追加到列表末尾
+            - 增强对探索覆盖率和零值Q值的监控
         """
         self.rl_episodes.append(episode)
         self.rl_episode_rewards.append(avg_reward)
@@ -140,6 +141,26 @@ class TrainingMonitor:
         
         if q_stats:
             q_stats['episode'] = episode
+            # 增强Q值统计：添加探索覆盖率详细分析
+            if 'exploration_coverage' in q_stats:
+                coverage = q_stats['exploration_coverage']
+                if coverage < 90:  # 如果探索覆盖率低于90%
+                    q_stats['exploration_issue'] = f'低探索覆盖率: {coverage}%'
+                elif coverage >= 95:
+                    q_stats['exploration_issue'] = f'高探索覆盖率: {coverage}%'
+                else:
+                    q_stats['exploration_issue'] = f'正常探索覆盖率: {coverage}%'
+            
+            # 监控零值Q值问题
+            if 'zero_q_percentage' in q_stats:
+                zero_q_pct = q_stats['zero_q_percentage']
+                if zero_q_pct > 15:  # 如果零值Q值占比超过15%
+                    q_stats['zero_q_issue'] = f'高零值Q值: {zero_q_pct}%'
+                elif zero_q_pct < 5:
+                    q_stats['zero_q_issue'] = f'低零值Q值: {zero_q_pct}%'
+                else:
+                    q_stats['zero_q_issue'] = f'正常零值Q值: {zero_q_pct}%'
+            
             self.q_value_stats.append(q_stats)
             
     def record_online_day(self, day: int, reward: float, inventory: int, price: float) -> None:
@@ -177,6 +198,69 @@ class TrainingMonitor:
             'inventory': inventory,
             'price': price
         })
+    
+    def analyze_exploration_issues(self, q_table: Dict[int, np.ndarray], episode: int) -> Dict[str, Any]:
+        """
+        分析探索问题，特别是零值Q值和低探索覆盖率问题
+        
+        Args:
+            q_table (Dict[int, np.ndarray]): Q表数据
+            episode (int): 当前训练轮次
+            
+        Returns:
+            Dict[str, Any]: 探索问题分析结果
+        """
+        analysis = {
+            'episode': episode,
+            'total_states': len(q_table),
+            'total_actions': 0,
+            'zero_q_count': 0,
+            'explored_pairs': 0,
+            'exploration_coverage': 0.0,
+            'zero_q_percentage': 0.0,
+            'issues': []
+        }
+        
+        if not q_table:
+            analysis['issues'].append('Q表为空')
+            return analysis
+        
+        # 计算总状态-动作对数量
+        n_actions = len(list(q_table.values())[0]) if q_table else 0
+        analysis['total_actions'] = n_actions
+        total_pairs = len(q_table) * n_actions
+        
+        # 统计零值Q值和已探索状态-动作对
+        for state, q_values in q_table.items():
+            for action_idx, q_value in enumerate(q_values):
+                if q_value == 0.0:
+                    analysis['zero_q_count'] += 1
+                if q_value != 0.0:
+                    analysis['explored_pairs'] += 1
+        
+        # 计算覆盖率
+        if total_pairs > 0:
+            analysis['exploration_coverage'] = round(analysis['explored_pairs'] / total_pairs * 100, 1)
+            analysis['zero_q_percentage'] = round(analysis['zero_q_count'] / total_pairs * 100, 1)
+        
+        # 识别具体问题
+        if analysis['exploration_coverage'] < 90:
+            analysis['issues'].append(f'低探索覆盖率: {analysis["exploration_coverage"]}%')
+        
+        if analysis['zero_q_percentage'] > 15:
+            analysis['issues'].append(f'高零值Q值占比: {analysis["zero_q_percentage"]}%')
+        
+        # 识别具体状态的问题
+        problematic_states = []
+        for state, q_values in q_table.items():
+            zero_count = sum(1 for q in q_values if q == 0.0)
+            if zero_count >= n_actions * 0.5:  # 超过一半动作Q值为0
+                problematic_states.append(state)
+        
+        if problematic_states:
+            analysis['issues'].append(f'问题状态: {problematic_states}')
+        
+        return analysis
         
     def get_training_summary(self) -> Dict[str, Any]:
         """
@@ -188,11 +272,11 @@ class TrainingMonitor:
         Returns:
             Dict[str, Any]: 训练摘要字典，包含以下字段：
                 - training_duration (str): 训练总时长
-                - bnn_epochs (int): BNN训练轮次数
+                - bnn_epochs (int): NGBoost训练轮次数
                 - rl_episodes (int): RL训练轮次数
                 - online_days (int): 在线学习天数
-                - final_bnn_train_loss (float): 最终BNN训练损失
-                - final_bnn_val_loss (float): 最终BNN验证损失
+                - final_bnn_train_loss (float): 最终NGBoost训练损失
+                - final_bnn_val_loss (float): 最终NGBoost验证损失
                 - final_rl_avg_reward (float): 最终RL平均奖励
                 - final_exploration_rate (float): 最终探索率
                 - best_rl_avg_reward (float): 最佳RL平均奖励
@@ -222,7 +306,7 @@ class TrainingMonitor:
         保存训练指标到文件
         
         将训练过程中的所有指标保存到多种格式的文件中，包括JSON、CSV和Pickle格式。
-        支持BNN、RL、在线学习等不同阶段的指标保存。
+        支持NGBoost、RL、在线学习等不同阶段的指标保存。
         
         Args:
             filename_prefix (str): 文件名前缀，默认为'training_metrics'
@@ -321,21 +405,17 @@ class TrainingMonitor:
             - 支持跨会话的状态恢复
             - 保持所有历史数据和指标完整性
         """
-        try:
-            with open(pickle_file, 'rb') as f:
-                loaded_monitor = pickle.load(f)
-            
-            # 复制所有属性到当前实例
-            for attr_name in dir(loaded_monitor):
-                if not attr_name.startswith('_'):
-                    attr_value = getattr(loaded_monitor, attr_name)
-                    setattr(self, attr_name, attr_value)
-            
-            print(f"训练监控器状态已从 {pickle_file} 加载")
-            return True
-        except Exception as e:
-            print(f"加载pickle文件失败: {e}")
-            return False
+        with open(pickle_file, 'rb') as f:
+            loaded_monitor = pickle.load(f)
+        
+        # 复制所有属性到当前实例
+        for attr_name in dir(loaded_monitor):
+            if not attr_name.startswith('_'):
+                attr_value = getattr(loaded_monitor, attr_name)
+                setattr(self, attr_name, attr_value)
+        
+        print(f"训练监控器状态已从 {pickle_file} 加载")
+        return True
         
     def plot_training_curves(self, save_plots: bool = True) -> List[str]:
         """
@@ -360,7 +440,7 @@ class TrainingMonitor:
         plots_saved = []
         
         # 设置符合学术期刊的字体和样式
-        plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'Helvetica', 'sans-serif']
+        plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'sans-serif']
         plt.rcParams['axes.unicode_minus'] = False
         plt.rcParams['axes.linewidth'] = 1.5  # 增加坐标轴宽度
         plt.rcParams['xtick.major.width'] = 1.5
@@ -518,7 +598,7 @@ class TrainingMonitor:
         # 4. 离线训练每日数据可视化
         if hasattr(self, 'daily_training_data') and self.daily_training_data:
             # 使用英文显示，移除中文字体设置
-            plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica', 'sans-serif']
+            plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
             plt.rcParams['axes.unicode_minus'] = False
             plt.style.use('seaborn-v0_8-whitegrid')  # 使用美观的样式
             
@@ -686,69 +766,64 @@ class TrainingMonitor:
         print(f"训练指标已从 {json_file} 加载")
         
     def generate_training_report(self) -> str:
-        """Generate training report"""
-        try:
-            report = []
-            report.append("=" * 60)
-            report.append("REINFORCEMENT LEARNING TRAINING REPORT")
-            report.append("=" * 60)
+        """生成训练报告"""
+        report = []
+        report.append("=" * 60)
+        report.append("强化学习训练报告")
+        report.append("=" * 60)
+        
+        # 训练摘要
+        report.append("\n[训练摘要]")
+        report.append(f"训练时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append(f"总训练天数: {len(self.rl_episodes) * 90}")
+        report.append(f"总模拟天数: {len(self.online_days)}")
+        
+        if self.rl_episode_rewards:
+            avg_reward = np.mean(self.rl_episode_rewards)
+            final_reward = self.rl_episode_rewards[-1]
+            report.append(f"平均奖励: {avg_reward:.2f}")
+            report.append(f"最终奖励: {final_reward:.2f}")
+        
+        # 关键指标
+        report.append("\n[关键指标]")
+        if self.q_value_stats:
+            latest_stats = self.q_value_stats[-1]
+            report.append(f"零Q值百分比: {latest_stats['zero_q_percentage']:.2f}%")
+            report.append(f"探索覆盖率: {latest_stats['exploration_coverage']:.2f}%")
+            report.append(f"平均Q值: {latest_stats['mean_q_value']:.4f}")
+            report.append(f"状态访问次数: {latest_stats['num_state_visits']}")
+        
+        # 训练效果分析
+        report.append("\n[训练效果分析]")
+        if len(self.q_value_stats) > 1:
+            first_stats = self.q_value_stats[0]
+            last_stats = self.q_value_stats[-1]
             
-            # Training summary
-            report.append("\n[TRAINING SUMMARY]")
-            report.append(f"Training Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            report.append(f"Total Training Days: {len(self.rl_episodes) * 90}")
-            report.append(f"Total Simulation Days: {len(self.online_days)}")
+            zero_q_improvement = first_stats['zero_q_percentage'] - last_stats['zero_q_percentage']
+            coverage_improvement = last_stats['exploration_coverage'] - first_stats['exploration_coverage']
             
-            if self.rl_episode_rewards:
-                avg_reward = np.mean(self.rl_episode_rewards)
-                final_reward = self.rl_episode_rewards[-1]
-                report.append(f"Average Reward: {avg_reward:.2f}")
-                report.append(f"Final Reward: {final_reward:.2f}")
+            report.append(f"零Q值百分比改善: {zero_q_improvement:.2f}%")
+            report.append(f"探索覆盖率改善: {coverage_improvement:.2f}%")
             
-            # Key metrics
-            report.append("\n[KEY METRICS]")
-            if self.q_value_stats:
-                latest_stats = self.q_value_stats[-1]
-                report.append(f"Zero Q-value Percentage: {latest_stats['zero_q_percentage']:.2f}%")
-                report.append(f"Exploration Coverage: {latest_stats['exploration_coverage']:.2f}%")
-                report.append(f"Average Q-value: {latest_stats['mean_q_value']:.4f}")
-                report.append(f"State Visit Count: {latest_stats['num_state_visits']}")
-            
-            # Training effectiveness analysis
-            report.append("\n[TRAINING EFFECTIVENESS ANALYSIS]")
-            if len(self.q_value_stats) > 1:
-                first_stats = self.q_value_stats[0]
-                last_stats = self.q_value_stats[-1]
+            if zero_q_improvement > 10:
+                report.append("[正常] Q值探索效果良好")
+            else:
+                report.append("[警告] Q值探索可能需要更多训练")
                 
-                zero_q_improvement = first_stats['zero_q_percentage'] - last_stats['zero_q_percentage']
-                coverage_improvement = last_stats['exploration_coverage'] - first_stats['exploration_coverage']
-                
-                report.append(f"Zero Q-value Percentage Improvement: {zero_q_improvement:.2f}%")
-                report.append(f"Exploration Coverage Improvement: {coverage_improvement:.2f}%")
-                
-                if zero_q_improvement > 10:
-                    report.append("[OK] Q-value exploration effectiveness good")
-                else:
-                    report.append("[WARNING] Q-value exploration may need more training")
-                    
-                if coverage_improvement > 20:
-                    report.append("[OK] State space exploration sufficient")
-                else:
-                    report.append("[WARNING] State space exploration may be insufficient")
-            
-            report.append("\n" + "=" * 60)
-            
-            # Save report
-            report_filename = f"../05_分析报告/training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            with open(report_filename, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(report))
-            
-            print(f"Training report saved: {report_filename}")
-            return '\n'.join(report)
-            
-        except Exception as e:
-            print(f"Error when generating training report: {e}")
-            return "Training report generation failed"
+            if coverage_improvement > 20:
+                report.append("[正常] 状态空间探索充分")
+            else:
+                report.append("[警告] 状态空间探索可能不足")
+        
+        report.append("\n" + "=" * 60)
+        
+        # 保存报告
+        report_filename = f"../05_分析报告/training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(report_filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(report))
+        
+        print(f"训练报告已保存: {report_filename}")
+        return '\n'.join(report)
 
 
 # 全局监控器实例

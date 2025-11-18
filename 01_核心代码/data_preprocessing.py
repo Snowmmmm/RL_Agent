@@ -47,9 +47,10 @@ class HotelDataPreprocessor:
         
         这是主要的预处理流水线，按顺序执行以下步骤：
         1. 从CSV文件加载原始酒店预订数据
-        2. 调用clean_data进行数据清洗
-        3. 调用construct_daily_demand_labels构造每日需求标签
-        4. 调用construct_features进行特征工程
+        2. 过滤只保留City Hotel的数据
+        3. 调用clean_data进行数据清洗
+        4. 调用construct_daily_demand_labels构造每日需求标签
+        5. 调用construct_features进行特征工程
         
         Args:
             file_path (str): 原始数据文件的路径
@@ -65,14 +66,39 @@ class HotelDataPreprocessor:
         df = pd.read_csv(file_path)
         print(f"数据加载完成，共{len(df)}条记录")
         
+        # 只保留City Hotel的数据
+        initial_count = len(df)
+        df = df[df['hotel'] == 'City Hotel'].copy()
+        city_hotel_count = len(df)
+        print(f"过滤后只保留City Hotel数据，从{initial_count}条记录减少到{city_hotel_count}条记录")
+        
         # 数据清洗
         df = self.clean_data(df)
         
-        # 构造每日需求标签
-        daily_demand = self.construct_daily_demand_labels(df)
+        # 构造每日需求标签（返回线上和线下用户数据）
+        online_daily_stats, offline_daily_stats = self.construct_daily_demand_labels(df)
+        
+        # 合并线上和线下用户数据，构造综合特征
+        # 将两个数据框合并为一个综合的数据框用于特征工程
+        combined_daily_stats = online_daily_stats.copy()
+        # 重命名线上用户列
+        online_cols = [col for col in online_daily_stats.columns if col not in ['date']]
+        for col in online_cols:
+            combined_daily_stats[f'online_{col}'] = combined_daily_stats[col]
+            if col in offline_daily_stats.columns:
+                combined_daily_stats[f'offline_{col}'] = offline_daily_stats[col]
+        
+        # 添加总需求列
+        combined_daily_stats['booked_demand'] = combined_daily_stats['online_booked_demand'] + combined_daily_stats['offline_booked_demand']
+        combined_daily_stats['actual_demand'] = combined_daily_stats['online_actual_demand'] + combined_daily_stats['offline_actual_demand']
+        combined_daily_stats['avg_price'] = (combined_daily_stats['online_avg_price'] + combined_daily_stats['offline_avg_price']) / 2
+        combined_daily_stats['price_std'] = (combined_daily_stats['online_price_std'] + combined_daily_stats['offline_price_std']) / 2
+        combined_daily_stats['min_price'] = np.minimum(combined_daily_stats['online_min_price'], combined_daily_stats['offline_min_price'])
+        combined_daily_stats['max_price'] = np.maximum(combined_daily_stats['online_max_price'], combined_daily_stats['offline_max_price'])
+        combined_daily_stats['median_price'] = (combined_daily_stats['online_median_price'] + combined_daily_stats['offline_median_price']) / 2
         
         # 构造特征
-        features_df = self.construct_features(daily_demand)
+        features_df = self.construct_features(combined_daily_stats)
         
         return features_df
     
@@ -138,28 +164,27 @@ class HotelDataPreprocessor:
     
     def construct_daily_demand_labels(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        构造每日需求标签（区分线上和线下用户）
+        构造每日需求标签（区分线上和线下用户，包含预定需求和实际需求）
         
-        基于酒店预订数据构造每日需求标签，分别统计线上和线下用户的需求：
-        1. 创建到达日期
-        2. 筛选有效预订（未取消且实际入住的订单）
-        3. 根据客户类型分别统计每日需求、平均价格和价格分布
-        4. 填充缺失的日期，确保时间序列连续性
-        5. 对无订单的日期进行价格信息插值填充
+        基于酒店预订数据构造每日需求标签，分别统计线上和线下用户的两种需求：
+        1. 预定需求：包含取消的订单，反映客户预订意愿
+        2. 实际需求：去除取消的订单，反映实际入住情况
+        3. 考虑住宿顺延，将stays_in_weekend_nights和stays_in_week_nights分布到对应日期
         
         Args:
             df (pd.DataFrame): 清洗后的酒店预订数据
             
         Returns:
             tuple[pd.DataFrame, pd.DataFrame]: 线上和线下用户的每日需求数据框
-            列包括：date, daily_demand, avg_price, price_std, min_price, max_price, median_price, customer_type
+            列包括：date, booked_demand, actual_demand, avg_price, price_std, min_price, max_price, median_price, customer_type
             
         Note:
-            - 只考虑未取消且实际入住的订单作为有效需求
-            - 对缺失日期使用0填充需求量，价格信息通过插值填充
-            - 价格插值使用相邻日期的价格信息，最后用整体平均值兜底
+            - 预定需求包含所有订单（无论是否取消）
+            - 实际需求只包含未取消的订单
+            - 住宿天数会顺延到后续对应日期
+            - 价格统计基于实际入住订单的价格
         """
-        print("正在构造每日需求标签（区分线上和线下用户）...")
+        print("正在构造每日需求标签（区分预定需求和实际需求）...")
         
         # 创建到达日期
         df['arrival_date'] = pd.to_datetime(
@@ -168,47 +193,137 @@ class HotelDataPreprocessor:
             df['arrival_date_day_of_month'].astype(str)
         )
         
-        # 筛选有效预订（未取消且实际入住）
-        valid_bookings = df[
-            (df['is_canceled'] == 0) & 
-            (df['stays_in_weekend_nights'] + df['stays_in_week_nights'] >= 1)
-        ].copy()
-        
-        # 分别处理线上和线下用户
-        online_bookings = valid_bookings[valid_bookings['customer_type'] == '线上用户'].copy()
-        offline_bookings = valid_bookings[valid_bookings['customer_type'] == '线下用户'].copy()
-        
-        print(f"有效订单总数: {len(valid_bookings)}")
-        print(f"线上用户订单数: {len(online_bookings)} ({len(online_bookings)/len(valid_bookings)*100:.1f}%)")
-        print(f"线下用户订单数: {len(offline_bookings)} ({len(offline_bookings)/len(valid_bookings)*100:.1f}%)")
-        
-        def create_daily_stats(bookings, customer_type):
-            """为指定客户类型创建每日统计"""
-            if len(bookings) == 0:
-                # 如果没有该类型的订单，创建空的数据框
-                daily_stats = pd.DataFrame(columns=['date', 'daily_demand', 'avg_price', 'price_std', 'min_price', 'max_price', 'median_price'])
-                return daily_stats
+        def distribute_stays_to_dates(arrival_date, weekend_nights, week_nights, is_canceled):
+            """
+            将住宿天数分布到对应日期，考虑顺延
+            
+            Args:
+                arrival_date: 到达日期
+                weekend_nights: 周末住宿晚数
+                week_nights: 工作日住宿晚数
+                is_canceled: 是否取消
                 
-            # 按日期分组统计每日需求、平均价格和价格分布
-            daily_stats = bookings.groupby('arrival_date').agg({
-                'adr': ['count', 'mean', 'std', 'min', 'max', 'median']
-            }).round(2)
+            Returns:
+                dict: 日期到住宿天数的映射
+            """
+            stay_dates = {}
+            current_date = arrival_date
             
-            # 重命名列
-            daily_stats.columns = ['daily_demand', 'avg_price', 'price_std', 'min_price', 'max_price', 'median_price']
-            daily_stats = daily_stats.reset_index()
-            daily_stats.rename(columns={'arrival_date': 'date'}, inplace=True)
-            daily_stats['customer_type'] = customer_type
+            # 先分配周末住宿天数
+            remaining_weekend = weekend_nights
+            remaining_week = week_nights
             
+            while remaining_weekend > 0 or remaining_week > 0:
+                # 判断当前日期是周末还是工作日
+                if current_date.weekday() >= 5:  # 周六(5)或周日(6)
+                    if remaining_weekend > 0:
+                        stay_dates[current_date] = stay_dates.get(current_date, 0) + 1
+                        remaining_weekend -= 1
+                    elif remaining_week > 0:  # 周末也可以住工作日预定的房间
+                        stay_dates[current_date] = stay_dates.get(current_date, 0) + 1
+                        remaining_week -= 1
+                else:  # 工作日
+                    if remaining_week > 0:
+                        stay_dates[current_date] = stay_dates.get(current_date, 0) + 1
+                        remaining_week -= 1
+                    elif remaining_weekend > 0:  # 工作日也可以住周末预定的房间
+                        stay_dates[current_date] = stay_dates.get(current_date, 0) + 1
+                        remaining_weekend -= 1
+                
+                # 移动到下一天
+                current_date += timedelta(days=1)
+            
+            return stay_dates
+        
+        def create_daily_demand_stats(bookings_df, customer_type):
+            """为指定客户类型创建每日需求统计"""
+            if len(bookings_df) == 0:
+                # 如果没有该类型的订单，创建空的数据框
+                daily_stats = pd.DataFrame(columns=[
+                    'date', 'booked_demand', 'actual_demand', 'avg_price', 'price_std', 
+                    'min_price', 'max_price', 'median_price', 'customer_type'
+                ])
+                return daily_stats
+            
+            # 初始化每日需求统计
+            daily_booked_demand = {}  # 预定需求（包含取消）
+            daily_actual_demand = {}  # 实际需求（去除取消）
+            daily_prices = {}  # 每日价格（基于实际入住）
+            
+            # 处理每个订单
+            for _, booking in bookings_df.iterrows():
+                arrival_date = booking['arrival_date']
+                weekend_nights = booking['stays_in_weekend_nights']
+                week_nights = booking['stays_in_week_nights']
+                is_canceled = booking['is_canceled']
+                adr = booking['adr']
+                
+                # 将住宿天数分布到对应日期
+                stay_dates = distribute_stays_to_dates(arrival_date, weekend_nights, week_nights, is_canceled)
+                
+                # 更新预定需求（包含取消的订单）
+                for stay_date, stay_count in stay_dates.items():
+                    daily_booked_demand[stay_date] = daily_booked_demand.get(stay_date, 0) + stay_count
+                
+                # 更新实际需求（只包含未取消的订单）
+                if is_canceled == 0:
+                    for stay_date, stay_count in stay_dates.items():
+                        daily_actual_demand[stay_date] = daily_actual_demand.get(stay_date, 0) + stay_count # 未取消订单的住宿天数
+                        
+                        # 收集价格信息（只从未取消订单中收集）
+                        if stay_date not in daily_prices: # 初始化价格列表
+                            daily_prices[stay_date] = [] # 初始化价格列表
+                        daily_prices[stay_date].append(adr) # 未取消订单的价格
+            
+            # 创建日期范围
+            all_dates = sorted(set(daily_booked_demand.keys()) | set(daily_actual_demand.keys()))
+            
+            # 构建每日统计
+            daily_stats_list = []
+            for date in all_dates:
+                booked_demand = daily_booked_demand.get(date, 0)
+                actual_demand = daily_actual_demand.get(date, 0)
+                
+                # 价格统计（基于实际入住订单）
+                if date in daily_prices and daily_prices[date]:
+                    prices = daily_prices[date]
+                    avg_price = np.mean(prices)
+                    price_std = np.std(prices)
+                    min_price = np.min(prices)
+                    max_price = np.max(prices)
+                    median_price = np.median(prices)
+                else:
+                    # 没有实际入住的日期，使用默认值
+                    avg_price = 120.0
+                    price_std = 0.0
+                    min_price = 120.0
+                    max_price = 120.0
+                    median_price = 120.0
+                
+                daily_stats_list.append({
+                    'date': date,
+                    'booked_demand': booked_demand,
+                    'actual_demand': actual_demand,
+                    'avg_price': avg_price,
+                    'price_std': price_std,
+                    'min_price': min_price,
+                    'max_price': max_price,
+                    'median_price': median_price,
+                    'customer_type': customer_type
+                })
+            
+            daily_stats = pd.DataFrame(daily_stats_list)
             return daily_stats
         
         # 分别为线上和线下用户创建每日统计
-        online_daily_stats = create_daily_stats(online_bookings, '线上用户')
-        offline_daily_stats = create_daily_stats(offline_bookings, '线下用户')
+        online_daily_stats = create_daily_demand_stats(df[df['customer_type'] == '线上用户'].copy(), '线上用户')
+        offline_daily_stats = create_daily_demand_stats(df[df['customer_type'] == '线下用户'].copy(), '线下用户')
         
-        # 获取完整的日期范围（基于所有有效订单）
-        if len(valid_bookings) > 0:
-            date_range = pd.date_range(valid_bookings['arrival_date'].min(), valid_bookings['arrival_date'].max())
+        # 获取完整的日期范围（基于所有订单）
+        all_bookings = df[df['stays_in_weekend_nights'] + df['stays_in_week_nights'] >= 1].copy()
+        
+        if len(all_bookings) > 0:
+            date_range = pd.date_range(all_bookings['arrival_date'].min(), all_bookings['arrival_date'].max())
             
             # 为线上用户数据填充缺失日期
             online_daily_stats = online_daily_stats.set_index('date').reindex(date_range, fill_value=0).reset_index()
@@ -221,8 +336,9 @@ class HotelDataPreprocessor:
             offline_daily_stats['customer_type'] = '线下用户'
             
             # 对没有订单的日期，填充价格统计信息
-            for stats_df, bookings in [(online_daily_stats, online_bookings), (offline_daily_stats, offline_bookings)]:
-                if len(bookings) > 0:
+            for stats_df, customer_type in [(online_daily_stats, '线上用户'), (offline_daily_stats, '线下用户')]:
+                customer_bookings = all_bookings[all_bookings['customer_type'] == customer_type]
+                if len(customer_bookings) > 0:
                     # 将0值替换为NaN以便插值
                     for col in ['avg_price', 'price_std', 'min_price', 'max_price', 'median_price']:
                         stats_df[col] = stats_df[col].replace(0, np.nan)
@@ -235,25 +351,40 @@ class HotelDataPreprocessor:
                     stats_df['median_price'] = stats_df['median_price'].interpolate()
                     
                     # 如果还有缺失，用该客户类型的整体平均值填充
-                    stats_df['avg_price'] = stats_df['avg_price'].fillna(bookings['adr'].mean())
-                    stats_df['price_std'] = stats_df['price_std'].fillna(bookings['adr'].std())
-                    stats_df['min_price'] = stats_df['min_price'].fillna(bookings['adr'].min())
-                    stats_df['max_price'] = stats_df['max_price'].fillna(bookings['adr'].max())
-                    stats_df['median_price'] = stats_df['median_price'].fillna(bookings['adr'].median())
+                    actual_prices = customer_bookings[customer_bookings['is_canceled'] == 0]['adr']
+                    if len(actual_prices) > 0:
+                        stats_df['avg_price'] = stats_df['avg_price'].fillna(actual_prices.mean())
+                        stats_df['price_std'] = stats_df['price_std'].fillna(actual_prices.std())
+                        stats_df['min_price'] = stats_df['min_price'].fillna(actual_prices.min())
+                        stats_df['max_price'] = stats_df['max_price'].fillna(actual_prices.max())
+                        stats_df['median_price'] = stats_df['median_price'].fillna(actual_prices.median())
+                    else:
+                        # 没有实际入住订单时使用默认值
+                        stats_df['avg_price'] = stats_df['avg_price'].fillna(120.0)
+                        stats_df['price_std'] = stats_df['price_std'].fillna(0.0)
+                        stats_df['min_price'] = stats_df['min_price'].fillna(120.0)
+                        stats_df['max_price'] = stats_df['max_price'].fillna(120.0)
+                        stats_df['median_price'] = stats_df['median_price'].fillna(120.0)
         
         print(f"线上用户需求标签构造完成，共{len(online_daily_stats)}天数据")
         print(f"线下用户需求标签构造完成，共{len(offline_daily_stats)}天数据")
         
-        if len(online_bookings) > 0:
-            print(f"线上用户价格统计 - 平均价格: {online_bookings['adr'].mean():.2f}, 价格范围: {online_bookings['adr'].min():.2f}-{online_bookings['adr'].max():.2f}")
-        if len(offline_bookings) > 0:
-            print(f"线下用户价格统计 - 平均价格: {offline_bookings['adr'].mean():.2f}, 价格范围: {offline_bookings['adr'].min():.2f}-{offline_bookings['adr'].max():.2f}")
+        # 统计需求对比
+        if len(online_daily_stats) > 0:
+            online_booked_total = online_daily_stats['booked_demand'].sum()
+            online_actual_total = online_daily_stats['actual_demand'].sum()
+            print(f"线上用户 - 总预定需求: {online_booked_total:.0f}, 总实际需求: {online_actual_total:.0f}, 取消率: {(1 - online_actual_total/max(online_booked_total, 1))*100:.1f}%")
+        
+        if len(offline_daily_stats) > 0:
+            offline_booked_total = offline_daily_stats['booked_demand'].sum()
+            offline_actual_total = offline_daily_stats['actual_demand'].sum()
+            print(f"线下用户 - 总预定需求: {offline_booked_total:.0f}, 总实际需求: {offline_actual_total:.0f}, 取消率: {(1 - offline_actual_total/max(offline_booked_total, 1))*100:.1f}%")
         
         return online_daily_stats, offline_daily_stats
     
     def construct_features(self, daily_stats: pd.DataFrame) -> pd.DataFrame:
         """
-        构造特征工程
+        构造特征工程（支持双需求：预定需求和实际需求）
         
         基于每日需求和价格数据构造丰富的特征集合，用于机器学习模型训练：
         
@@ -261,9 +392,11 @@ class HotelDataPreprocessor:
         - 基本时间特征：年、月、日、星期、季度、周数
         
         滞后特征（Lag Features）：
+        - 预定需求和实际需求的1、2、3、7、14、30天滞后值
         - 需求和价格的1、2、3、7、14、30天滞后值
         
         滚动统计特征（Rolling Statistics）：
+        - 预定需求和实际需求的3、7、14、30天移动平均和标准差
         - 需求和价格的3、7、14、30天移动平均和标准差
         - 价格区间（最高价-最低价）和价格变异系数（标准差/均值）
         
@@ -272,13 +405,16 @@ class HotelDataPreprocessor:
         - 季节编码（淡季、平季、旺季）
         
         需求-价格关系特征：
-        - 需求价格比率、价格需求弹性
+        - 预定需求价格比率、实际需求价格比率、价格需求弹性
         
         趋势特征：
-        - 基于7天窗口的需求和价格趋势（线性回归斜率）
+        - 基于7天窗口的预定需求、实际需求和价格趋势（线性回归斜率）
+        
+        取消率特征：
+        - 基于7天滚动窗口的取消率统计
         
         Args:
-            daily_stats (pd.DataFrame): 包含每日需求量和价格统计的基础数据
+            daily_stats (pd.DataFrame): 包含每日预定需求、实际需求和价格统计的基础数据
             
         Returns:
             pd.DataFrame: 包含完整特征工程的数据框
@@ -287,8 +423,9 @@ class HotelDataPreprocessor:
             - 使用前后向填充处理缺失值，确保时间序列连续性
             - 特征工程基于酒店业务理解，考虑了季节性、周期性、趋势性等因素
             - 滞后和滚动窗口的选择基于业务经验（短期1-3天，中期7-14天，长期30天）
+            - 新增取消率特征，反映客户行为模式
         """
-        print("正在构造特征...")
+        print("正在构造特征（支持双需求）...")
         
         df = daily_stats.copy()
         
@@ -300,16 +437,24 @@ class HotelDataPreprocessor:
         df['quarter'] = df['date'].dt.quarter
         df['weekofyear'] = df['date'].dt.isocalendar().week
         
-        # 滞后特征
+        # 滞后特征（双需求）
         for lag in [1, 2, 3, 7, 14, 30]:
-            df[f'demand_lag_{lag}'] = df['daily_demand'].shift(lag)
+            df[f'booked_demand_lag_{lag}'] = df['booked_demand'].shift(lag)
+            df[f'actual_demand_lag_{lag}'] = df['actual_demand'].shift(lag)
             df[f'price_lag_{lag}'] = df['avg_price'].shift(lag)
         
-        # 滚动统计特征
+        # 滚动统计特征（双需求）
         for window in [3, 7, 14, 30]:
-            df[f'demand_ma_{window}'] = df['daily_demand'].rolling(window=window, min_periods=1).mean()
+            # 预定需求滚动统计
+            df[f'booked_demand_ma_{window}'] = df['booked_demand'].rolling(window=window, min_periods=1).mean()
+            df[f'booked_demand_std_{window}'] = df['booked_demand'].rolling(window=window, min_periods=1).std()
+            
+            # 实际需求滚动统计
+            df[f'actual_demand_ma_{window}'] = df['actual_demand'].rolling(window=window, min_periods=1).mean()
+            df[f'actual_demand_std_{window}'] = df['actual_demand'].rolling(window=window, min_periods=1).std()
+            
+            # 价格滚动统计
             df[f'price_ma_{window}'] = df['avg_price'].rolling(window=window, min_periods=1).mean()
-            df[f'demand_std_{window}'] = df['daily_demand'].rolling(window=window, min_periods=1).std()
             df[f'price_std_{window}'] = df['avg_price'].rolling(window=window, min_periods=1).std()
         
         # 价格区间特征
@@ -324,17 +469,27 @@ class HotelDataPreprocessor:
         # 季节性特征
         df['season'] = df['month'].apply(self.get_season)
         
-        # 需求-价格关系特征
-        df['demand_price_ratio'] = df['daily_demand'] / (df['avg_price'] + 1e-8)
-        df['price_demand_elasticity'] = df['avg_price'].pct_change() / (df['daily_demand'].pct_change() + 1e-8)
+        # 工作日/周末特征
+        df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
         
-        # 趋势特征
-        df['demand_trend'] = df['daily_demand'].rolling(window=7, min_periods=1).apply(
+        # 取消率特征（新增）
+        df['cancellation_rate'] = (df['booked_demand'] - df['actual_demand']) / (df['booked_demand'] + 1e-8)
+        df['cancellation_rate_ma_7'] = df['cancellation_rate'].rolling(window=7, min_periods=1).mean()
+        df['cancellation_rate_std_7'] = df['cancellation_rate'].rolling(window=7, min_periods=1).std()
+        
+        # 趋势特征（双需求）
+        df['booked_demand_trend'] = df['booked_demand'].rolling(window=7, min_periods=1).apply(
+            lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0
+        )
+        df['actual_demand_trend'] = df['actual_demand'].rolling(window=7, min_periods=1).apply(
             lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0
         )
         df['price_trend'] = df['avg_price'].rolling(window=7, min_periods=1).apply(
             lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0
         )
+        
+        # 价格变异系数特征（7天滚动）
+        df['price_cv'] = df['avg_price'].rolling(window=7, min_periods=1).std() / (df['avg_price'].rolling(window=7, min_periods=1).mean() + 1e-8)
         
         # 处理缺失值
         df = df.fillna(method='bfill').fillna(method='ffill').fillna(0)
@@ -397,29 +552,56 @@ class HotelDataPreprocessor:
         # 为简化，只考虑周末
         return 1 if date.weekday() >= 5 else 0
     
-    def prepare_bnn_features(self, features_df: pd.DataFrame, action: Optional[int] = None, price_action: Optional[float] = None) -> torch.Tensor:
+    def prepare_ngboost_features(self, features_df: pd.DataFrame, action: Optional[int] = None, price_action: Optional[float] = None, demand_type: str = 'booked', customer_type: str = 'online') -> torch.Tensor:
         """
-        准备BNN模型的输入特征（季节、工作日/周末、价格）
+        准备NGBoost模型的输入特征（支持双需求：预定需求/实际需求，线上线下用户）
         
-        为贝叶斯神经网络准备标准化的输入特征，主要包括三个核心特征：
-        1. 季节性特征：反映酒店需求的季节性变化
-        2. 工作日/周末特征：反映周周期性需求模式
-        3. 价格特征：反映价格对需求的影响
+        为贝叶斯神经网络准备标准化的输入特征，主要包括六个核心特征：
+        1. 价格（在训练时使用平均价格，使用时是agent定价输入）
+        2. 是否周末
+        3. 季节特征
+        4. 价格变异系数
+        5. 需求趋势（基于过去7天的线性回归斜率）
+        6. 价格趋势（基于过去7天的线性回归斜率）
         
         Args:
             features_df (pd.DataFrame): 特征数据框，包含日期、价格等基础特征
             action (Optional[int], optional): 可选的动作参数，预留用于强化学习
             price_action (Optional[float], optional): 可选的价格动作，如果提供则使用指定价格
+            demand_type (str): 需求类型，'booked'表示预定需求，'actual'表示实际需求
+            customer_type (str): 客户类型，'online'表示线上用户，'offline'表示线下用户
             
         Returns:
-            torch.Tensor: 标准化的特征张量，形状为[3]（季节、是否周末、价格）
+            torch.Tensor: 标准化的特征张量，形状为[6]（价格、是否周末、季节、价格变异系数、需求趋势、价格趋势）
             
         Note:
-            - 该方法提取了影响酒店需求最核心的三个特征
+            - 该方法提取了影响酒店需求最核心的六个特征
+            - 支持双需求趋势选择，根据demand_type参数动态选择预定需求或实际需求趋势
+            - 支持线上线下用户分别记录，根据customer_type参数选择对应特征
             - 特征值都转换为浮点数，便于神经网络处理
-            - 价格特征使用历史平均价格作为默认值
+            - 价格特征在训练时使用平均价格，使用时使用agent定价输入
             - 所有特征都进行了合理的默认值处理，确保鲁棒性
         """
+        
+        # 获取价格特征（在训练时使用平均价格，使用时是agent定价输入）
+        if price_action is not None:
+            # 如果指定了价格动作，使用指定价格（RL agent定价）
+            price = float(price_action)
+        else:
+            # 训练时使用对应客户类型的平均价格
+            price_col = f'{customer_type}_avg_price'
+            if price_col in features_df.columns:
+                price = float(features_df[price_col].iloc[0])
+            elif 'avg_price' in features_df.columns:
+                price = float(features_df['avg_price'].iloc[0])
+            else:
+                price = 120.0  # 默认价格
+        
+        # 获取是否周末特征
+        if 'is_weekend' in features_df.columns:
+            is_weekend = float(features_df['is_weekend'].iloc[0])
+        else:
+            is_weekend = 0.0  # 默认工作日
         
         # 获取季节特征
         if 'season' in features_df.columns:
@@ -427,25 +609,38 @@ class HotelDataPreprocessor:
         else:
             season = 1.0  # 默认平季
         
-        # 获取工作日/周末特征
-        if 'is_weekend' in features_df.columns:
-            is_weekend = float(features_df['is_weekend'].iloc[0])
+        # 获取价格变异系数特征（使用对应客户类型的价格变异系数）
+        price_cv_col = f'{customer_type}_price_cv'
+        if price_cv_col in features_df.columns:
+            price_cv = float(features_df[price_cv_col].iloc[0])
+        elif 'price_cv' in features_df.columns:
+            price_cv = float(features_df['price_cv'].iloc[0])
         else:
-            is_weekend = 0.0  # 默认工作日
+            price_cv = 0.1  # 默认价格变异系数
         
-        # 获取价格特征
-        if price_action is not None:
-            # 如果指定了价格动作，使用指定价格
-            price = float(price_action)
-        elif 'avg_price' in features_df.columns:
-            # 使用历史平均价格
-            price = float(features_df['avg_price'].iloc[0])
+        # 获取需求趋势特征（基于过去7天的线性回归斜率，支持双需求和客户类型）
+        trend_col = f'{customer_type}_{demand_type}_demand_trend'
+        if trend_col in features_df.columns:
+            demand_trend = float(features_df[trend_col].iloc[0])
         else:
-            # 默认值
-            price = 100.0
+            # 降级到通用需求趋势
+            generic_trend_col = f'{demand_type}_demand_trend'
+            if generic_trend_col in features_df.columns:
+                demand_trend = float(features_df[generic_trend_col].iloc[0])
+            else:
+                demand_trend = 0.0  # 默认无趋势
         
-        # 组合特征 [季节, 是否周末, 价格]
-        features = [season, is_weekend, price]
+        # 获取价格趋势特征（基于过去7天的线性回归斜率，支持客户类型）
+        price_trend_col = f'{customer_type}_price_trend'
+        if price_trend_col in features_df.columns:
+            price_trend = float(features_df[price_trend_col].iloc[0])
+        elif 'price_trend' in features_df.columns:
+            price_trend = float(features_df['price_trend'].iloc[0])
+        else:
+            price_trend = 0.0  # 默认无趋势
+        
+        # 组合特征 [价格, 是否周末, 季节, 价格变异系数, 需求趋势, 价格趋势]
+        features = [price, is_weekend, season, price_cv, demand_trend, price_trend]
         
         return torch.FloatTensor(features)
     
@@ -496,8 +691,8 @@ class HotelDataPreprocessor:
                 test_samples = total_samples - train_samples - val_samples
                 print(f"调整后抽取数量: 训练集{train_samples} + 验证集{val_samples} + 测试集{test_samples} = {total_samples} 样本")
             
-            # 设置随机种子确保可重复性
-            np.random.seed(random_seed)
+            # 设置随机种子确保可重复性 - 可注释掉以启用随机变化
+            # np.random.seed(random_seed)  # 注释掉以允许随机变化
             
             # 创建样本索引
             all_indices = np.arange(total_samples)
@@ -804,7 +999,7 @@ if __name__ == "__main__":
     # 保存预处理器
     preprocessor.save_preprocessor('../02_训练模型/preprocessor.pkl')
     
-    # 测试特征准备
-    test_features = preprocessor.prepare_bnn_features(features_df.iloc[:1], action=2)
-    print(f"BNN输入特征维度：{test_features.shape}")
+    # 测试NGBoost特征准备
+    test_features = preprocessor.prepare_ngboost_features(features_df.iloc[:1], action=2)
+    print(f"NGBoost输入特征维度：{test_features.shape}")
     print("数据预处理测试完成！")
