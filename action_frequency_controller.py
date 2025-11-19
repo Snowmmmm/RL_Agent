@@ -23,6 +23,8 @@ from collections import defaultdict, Counter
 import warnings
 from scipy.interpolate import Rbf
 from mpl_toolkits.mplot3d import Axes3D
+import uuid
+import pickle
 warnings.filterwarnings('ignore')
 
 # 设置中文字体
@@ -37,6 +39,9 @@ OUTPUT_DIR = os.path.join(CURRENT_DIR, 'action_frequency_analysis')
 
 # 确保输出目录存在
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 使用字典存储Q表信息，避免文件读取冲突
+q_table_dict = {}
 
 def check_ngboost_models():
     """
@@ -95,15 +100,19 @@ def train_ngboost_models():
 def run_single_simulation(task_id):
     """
     运行单次模拟
-    返回Q表CSV文件路径
+    返回Q表数据的UUID
     """
     try:
+        # 生成唯一的UUID用于标识这次运行
+        run_uuid = str(uuid.uuid4())
+        
         # 构建命令 - 总是跳过NGBoost训练，因为已经在主函数中统一处理了
         cmd = [
             sys.executable, 
             MAIN_SCRIPT_PATH, 
             '--skip-hyperparameter-search',
-            '--skip-ngboost-training'
+            '--skip-ngboost-training',
+            f'--run-uuid={run_uuid}'
         ]
         
         # 设置环境变量，使matplotlib使用非交互式后端
@@ -116,7 +125,7 @@ def run_single_simulation(task_id):
         print(f"任务 {task_id} 开始执行Q-learning训练...")
         result = subprocess.run(
             cmd, 
-            cwd=os.path.dirname(MAIN_SCRIPT_PATH),
+            cwd=os.path.dirname(MAIN_SCRIPT_PATH), 
             capture_output=True, 
             text=True,
             timeout=6400,  # 60分钟超时，增加超时时间
@@ -129,41 +138,17 @@ def run_single_simulation(task_id):
             print(f"任务 {task_id} 失败: {result.stderr}")
             return None, None, None, None
             
-        # 查找生成的Q表CSV文件
-        q_table_files = glob.glob(os.path.join(RESULTS_DIR, f'q_table_main_*.csv'))
-        if not q_table_files:
-            print(f"任务 {task_id} 未找到Q表文件")
-            return None, None, None, None
-            
-        # 获取最新的Q表文件
-        latest_q_table = max(q_table_files, key=os.path.getctime)
+        # 检查Q表数据是否已存储到临时文件中
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        temp_file_path = os.path.join(temp_dir, f"q_table_{run_uuid}.csv")
         
-        # 查找对应的统计文件
-        stats_files = glob.glob(os.path.join(RESULTS_DIR, f'q_table_stats_*.csv'))
-        latest_stats_file = None
-        if stats_files:
-            # 尝试匹配时间戳
-            q_table_timestamp = os.path.basename(latest_q_table).split('_')[-1].replace('.csv', '')
-            for stats_file in stats_files:
-                stats_timestamp = os.path.basename(stats_file).split('_')[-1].replace('.csv', '')
-                if stats_timestamp == q_table_timestamp:
-                    latest_stats_file = stats_file
-                    break
-                    
-        # 查找对应的热力图文件
-        heatmap_files = glob.glob(os.path.join(CURRENT_DIR, '04_结果输出', f'q_table_heatmap_*.png'))
-        latest_heatmap_file = None
-        if heatmap_files:
-            # 尝试匹配时间戳
-            q_table_timestamp = os.path.basename(latest_q_table).split('_')[-1].replace('.csv', '')
-            for heatmap_file in heatmap_files:
-                heatmap_timestamp = os.path.basename(heatmap_file).split('_')[-1].replace('.png', '')
-                if heatmap_timestamp == q_table_timestamp:
-                    latest_heatmap_file = heatmap_file
-                    break
+        if not os.path.exists(temp_file_path):
+            print(f"任务 {task_id} 未找到Q表数据")
+            return None, None, None, None
         
         print(f"任务 {task_id} 完成，耗时: {end_time - start_time:.2f} 秒")
-        return latest_q_table, latest_stats_file, latest_heatmap_file, end_time - start_time
+        return run_uuid, None, None, end_time - start_time
         
     except subprocess.TimeoutExpired:
         print(f"任务 {task_id} 超时")
@@ -172,14 +157,26 @@ def run_single_simulation(task_id):
         print(f"任务 {task_id} 出现异常: {str(e)}")
         return None, None, None, None
 
-def analyze_q_table(q_table_path):
+def analyze_q_table(q_table_uuid):
     """
     分析单个Q表，提取最优动作
     返回每个状态的最优动作
     """
     try:
-        # 读取Q表
-        df = pd.read_csv(q_table_path)
+        # 从临时文件中获取Q表数据
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        temp_file_path = os.path.join(temp_dir, f"q_table_{q_table_uuid}.csv")
+        
+        if not os.path.exists(temp_file_path):
+            print(f"未找到UUID为 {q_table_uuid} 的Q表临时文件")
+            return {}
+            
+        # 从临时文件读取Q表数据
+        with open(temp_file_path, 'r', encoding='utf-8') as f:
+            q_table_str = f.read()
+        
+        df = pd.read_csv(pd.io.common.StringIO(q_table_str))
         
         # 获取状态列
         state_col = 'state' if 'state' in df.columns else df.columns[0]
@@ -188,18 +185,25 @@ def analyze_q_table(q_table_path):
         best_actions = {}
         for _, row in df.iterrows():
             state = row[state_col]
-            # 获取所有动作列（排除状态列）
-            action_cols = [col for col in df.columns if col != state_col and col.startswith('action_')]
-            if not action_cols:
-                # 如果列名不是action_格式，则尝试其他方式
-                action_cols = [col for col in df.columns if col != state_col]
             
-            # 获取Q值
-            q_values = [row[col] for col in action_cols]
-            
-            # 找到最优动作
-            best_action_idx = np.argmax(q_values)
-            best_actions[state] = best_action_idx
+            # 首先尝试使用Q表中已有的best_action列
+            if 'best_action' in df.columns:
+                best_action = row['best_action']
+                best_actions[state] = int(best_action)
+            else:
+                # 如果没有best_action列，则通过Q值重新计算（兼容旧格式）
+                # 获取所有动作列（排除状态列）
+                action_cols = [col for col in df.columns if col != state_col and col.startswith('action_')]
+                if not action_cols:
+                    # 如果列名不是action_格式，则尝试其他方式
+                    action_cols = [col for col in df.columns if col != state_col]
+                
+                # 获取Q值
+                q_values = [row[col] for col in action_cols]
+                
+                # 找到最优动作
+                best_action_idx = np.argmax(q_values)
+                best_actions[state] = best_action_idx
             
         return best_actions
         
@@ -778,9 +782,9 @@ def main():
         print("\n分析Q表...")
         all_best_actions = []
         
-        for i, (q_table_path, stats_path, heatmap_path, run_time) in enumerate(valid_results):
+        for i, (q_table_uuid, stats_path, heatmap_path, run_time) in enumerate(valid_results):
             print(f"分析第 {i+1}/{len(valid_results)} 个Q表...")
-            best_actions = analyze_q_table(q_table_path)
+            best_actions = analyze_q_table(q_table_uuid)
             all_best_actions.append(best_actions)
         
         # 聚合最优动作

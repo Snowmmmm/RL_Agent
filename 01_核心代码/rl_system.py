@@ -300,13 +300,13 @@ class HotelEnvironment:
         
         if date_features is not None:
             # 获取线上用户预定需求NGBoost预测（使用线上价格）
-            if ngboost_predictor_online_booked is not None:
-                booked_demand_online, booked_variance_online = ngboost_predictor_online_booked(
-                    date_features, action_online, record_env_changes=True, user_type='online', demand_type='booked',
-                    demand_queues=self.demand_queues, price_queue=self.price_queue_online
-                )
-                predicted_booked_demand_online = booked_demand_online
-                predicted_booked_variance_online = booked_variance_online
+            # if ngboost_predictor_online_booked is not None:
+            #     booked_demand_online, booked_variance_online = ngboost_predictor_online_booked(
+            #         date_features, action_online, record_env_changes=True, user_type='online', demand_type='booked',
+            #         demand_queues=self.demand_queues, price_queue=self.price_queue_online
+            #     )
+            #     predicted_booked_demand_online = booked_demand_online
+            #     predicted_booked_variance_online = booked_variance_online
 
             # 获取线上用户实际需求NGBoost预测（使用线上价格）
             if ngboost_predictor_online_actual is not None:
@@ -318,13 +318,13 @@ class HotelEnvironment:
                 predicted_actual_variance_online = actual_variance_online
 
             # 获取线下用户预定需求NGBoost预测（使用线下价格）
-            if ngboost_predictor_offline_booked is not None:
-                booked_demand_offline, booked_variance_offline = ngboost_predictor_offline_booked(
-                    date_features, action_offline, record_env_changes=True, user_type='offline', demand_type='booked',
-                    demand_queues=self.demand_queues, price_queue=self.price_queue_offline
-                )
-                predicted_booked_demand_offline = booked_demand_offline
-                predicted_booked_variance_offline = booked_variance_offline
+            # if ngboost_predictor_offline_booked is not None:
+            #     booked_demand_offline, booked_variance_offline = ngboost_predictor_offline_booked(
+            #         date_features, action_offline, record_env_changes=True, user_type='offline', demand_type='booked',
+            #         demand_queues=self.demand_queues, price_queue=self.price_queue_offline
+            #     )
+            #     predicted_booked_demand_offline = booked_demand_offline
+            #     predicted_booked_variance_offline = booked_variance_offline
 
             # 获取线下用户实际需求NGBoost预测（使用线下价格）
             if ngboost_predictor_offline_actual is not None:
@@ -337,22 +337,22 @@ class HotelEnvironment:
 
         
         # 线上用户需求采样
-        booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
+        # booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
         actual_demand_online_sampled = max(0, int(np.random.normal(predicted_actual_demand_online, np.sqrt(predicted_actual_variance_online))))
         
         # 确保预定需求采样值大于实际需求采样值
-        while booked_demand_online_sampled <= actual_demand_online_sampled:
-            booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
-            actual_demand_online_sampled = max(0, int(np.random.normal(predicted_actual_demand_online, np.sqrt(predicted_actual_variance_online))))
+        # while booked_demand_online_sampled <= actual_demand_online_sampled:
+        #     booked_demand_online_sampled = max(0, int(np.random.normal(predicted_booked_demand_online, np.sqrt(predicted_booked_variance_online))))
+        #     actual_demand_online_sampled = max(0, int(np.random.normal(predicted_actual_demand_online, np.sqrt(predicted_actual_variance_online))))
         
         # 线下用户需求采样
-        booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
+        # booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
         actual_demand_offline_sampled = max(0, int(np.random.normal(predicted_actual_demand_offline, np.sqrt(predicted_actual_variance_offline))))
         
         # 确保预定需求采样值大于实际需求采样值
-        while booked_demand_offline_sampled <= actual_demand_offline_sampled:
-            booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
-            actual_demand_offline_sampled = max(0, int(np.random.normal(predicted_actual_demand_offline, np.sqrt(predicted_actual_variance_offline))))
+        # while booked_demand_offline_sampled <= actual_demand_offline_sampled:
+        #     booked_demand_offline_sampled = max(0, int(np.random.normal(predicted_booked_demand_offline, np.sqrt(predicted_booked_variance_offline))))
+        #     actual_demand_offline_sampled = max(0, int(np.random.normal(predicted_actual_demand_offline, np.sqrt(predicted_actual_variance_offline))))
         
         # # 总预定需求 = 线上预定需求 + 线下预定需求
         # predicted_booked_demand = predicted_booked_demand_online + predicted_booked_demand_offline
@@ -364,13 +364,13 @@ class HotelEnvironment:
         # predicted_actual_variance = predicted_actual_variance_online + predicted_actual_variance_offline
         
         # 采样后的总需求
-        total_booked_demand_sampled = booked_demand_online_sampled + booked_demand_offline_sampled
+        # total_booked_demand_sampled = booked_demand_online_sampled + booked_demand_offline_sampled
         total_actual_demand_sampled = actual_demand_online_sampled + actual_demand_offline_sampled
         
         # 更新4+1队列系统：将当前需求值和价格添加到队列中
-        self.demand_queues['online_booked'].appendleft(booked_demand_online_sampled)
+        # self.demand_queues['online_booked'].appendleft(booked_demand_online_sampled)
         self.demand_queues['online_actual'].appendleft(actual_demand_online_sampled)
-        self.demand_queues['offline_booked'].appendleft(booked_demand_offline_sampled)
+        # self.demand_queues['offline_booked'].appendleft(booked_demand_offline_sampled)
         self.demand_queues['offline_actual'].appendleft(actual_demand_offline_sampled)
         self.price_queue.appendleft(price)  # 使用线上价格进行历史记录（兼容旧逻辑）
         self.price_queue_online.appendleft(price_online)    # 记录线上价格

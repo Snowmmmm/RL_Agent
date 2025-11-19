@@ -119,7 +119,7 @@ RL_CONFIG = {
     'epsilon_min': 0.01,  # 最小探索率，与最终探索率保持一致
     
     # 训练配置
-    'episodes': 10, # 离线预训练轮数（从150增加到300，确保充分训练）
+    'episodes': 320, # 离线预训练轮数（从150增加到300，确保充分训练）
     'online_learning_days': 90,  # 在线学习天数
     'update_frequency': 7,  # NGBoost模型更新频率（天）
     

@@ -1416,6 +1416,8 @@ def main() -> None:
                        help='跳过超参数搜索，直接使用最佳超参数')
     parser.add_argument('--skip-ngboost-training', action='store_true',
                        help='跳过NGBoost训练，直接使用已有的NGBoost模型训练Q-learning')
+    parser.add_argument('--run-uuid', type=str, default=None,
+                       help='运行UUID，用于Q表存储和识别')
     # parser.add_argument('--simulate-days', type=int, default=90,
     #                    help='模拟天数')
     # parser.add_argument('--start-date', type=str, default='2017-01-01',
@@ -1772,6 +1774,25 @@ def main() -> None:
             q_table_csv_path = f'../05_分析报告/q_table_main_{timestamp}.csv'
             q_table_df.to_csv(q_table_csv_path, index=False)
             print(f"\nQ表已保存到CSV文件: {q_table_csv_path}")
+            
+            # 如果提供了run_uuid，则尝试将Q表数据存储到临时文件中
+            if args.run_uuid:
+                try:
+                    # 将Q表数据转换为字符串格式
+                    q_table_str = q_table_df.to_csv(index=False)
+                    
+                    # 创建临时文件存储Q表数据
+                    import tempfile
+                    temp_dir = tempfile.gettempdir()
+                    temp_file_path = os.path.join(temp_dir, f"q_table_{args.run_uuid}.csv")
+                    
+                    # 将Q表数据写入临时文件
+                    with open(temp_file_path, 'w', encoding='utf-8') as f:
+                        f.write(q_table_str)
+                    
+                    print(f"Q表数据已存储到临时文件: {temp_file_path}")
+                except Exception as e:
+                    print(f"无法将Q表数据存储到临时文件: {e}")
             
             # 同时保存Q表统计信息
             if q_stats:
