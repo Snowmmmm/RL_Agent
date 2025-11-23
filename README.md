@@ -222,5 +222,153 @@ python action_frequency_controller.py --num-runs 30 --max-workers 6 --episodes 4
 - **提高效率**：大幅减少总体运行时间，特别是在多次运行时
 - **资源节约**：减少计算资源消耗，避免不必要的模型训练
 
+## 💾 模型保存格式说明
+
+### NGBoost模型保存格式
+
+NGBoost模型使用`joblib`格式保存，文件扩展名为`.pkl`，保存路径为`02_训练模型/`目录。模型数据包含以下字段：
+
+```python
+model_data = {
+    'model': self.model,                    # NGBoost模型实例
+    'feature_scaler': self.feature_scaler,  # 特征标准化器
+    'train_losses': self.train_losses,      # 训练损失历史
+    'val_losses': self.val_losses,          # 验证损失历史
+    'config': {                             # 模型配置参数
+        'distribution': self.distribution,  # 分布类型
+        'score': self.score,                # 评分函数
+        'n_estimators': self.n_estimators,  # 估计器数量
+        'learning_rate': self.learning_rate,# 学习率
+        'max_depth': self.max_depth,      # 最大深度
+        'min_samples_leaf': self.min_samples_leaf,  # 叶节点最小样本数
+        'subsample': self.subsample,        # 子采样比例
+        'random_state': self.random_state   # 随机种子
+    }
+}
+```
+
+**模型文件命名格式：**
+- `ngboost_model_{customer_type}_{demand_type}.pkl`
+- 例如：`ngboost_model_online_booked.pkl`、`ngboost_model_offline_actual.pkl`
+
+### Q-Learning智能体保存格式
+
+Q-Learning智能体使用`pickle`格式保存，文件扩展名为`.pkl`，保存路径为`02_训练模型/`目录。智能体数据包含以下字段：
+
+```python
+agent_data = {
+    'q_table': q_table_dict,                    # Q值表（状态-动作对的Q值）
+    'state_visit_count': state_visit_dict,      # 状态访问计数
+    'state_action_visit_count': state_action_visit_dict,  # 状态-动作对访问计数
+    'training_history': self.training_history,  # 训练历史记录
+    'hyperparameters': {                        # 超参数设置
+        'n_states': self.n_states,              # 状态数量
+        'n_actions': self.n_actions,            # 动作数量
+        'learning_rate': self.learning_rate,    # 学习率
+        'discount_factor': self.discount_factor,# 折扣因子
+        'epsilon_start': self.epsilon_start,  # 初始探索率
+        'epsilon_end': self.epsilon_end,      # 最终探索率
+        'epsilon_decay_steps': self.epsilon_decay_steps  # 探索率衰减步数
+    }
+}
+```
+
+**智能体文件命名格式：**
+- `q_agent_{type}.pkl`
+- 例如：`q_agent_pretrained.pkl`（预训练模型）、`q_agent_final.pkl`（最终模型）
+
+
+### 需求标准化器保存格式
+
+需求标准化器使用`joblib`格式保存，用于将预测结果转换回原始尺度：
+
+```python
+# 保存路径格式
+demand_scaler_path = f'../02_训练模型/demand_scaler_{customer_type}_{demand_type}.pkl'
+# 例如：demand_scaler_线上用户_booked.pkl、demand_scaler_线下用户_actual.pkl
+```
+
+### 数据预处理器保存格式
+
+数据预处理器使用`pickle`格式保存，包含完整的`HotelDataPreprocessor`实例状态，确保数据预处理的一致性和可重现性。
+
+**保存内容：**
+
+```python
+# 保存路径
+preprocessor_path = '../02_训练模型/preprocessor.pkl'
+
+# 预处理器保存的完整状态包括：
+preprocessor_state = {
+    'feature_columns': List[str],           # 特征列名列表（共50+个特征）
+    'scaler': Optional[Any],                # 数据预处理器中的特征标准化器（StandardScaler）
+    'categorical_encoders': Dict[str, Any], # 分类变量编码器字典
+    
+    # 完整的处理流水线状态：
+    # - 数据清洗规则（ADR范围0-500元，成人数最多4人等）
+    # - 客户分类逻辑（线上用户：market_segment='Online TA' 或 distribution_channel='TA/TO'）
+    # - 特征工程参数（滞后窗口、滚动统计周期等）
+    # - 缺失值处理策略（前后向填充）
+}
+```
+
+**核心功能模块：**
+
+1. **数据清洗模块**
+   - 缺失值处理：children、agent、company字段填充0
+   - 异常值截断：ADR>500元截断为500元，成人数>4人截断为4人
+   - 客户分类：自动区分线上用户与线下用户
+
+2. **需求标签构造模块**
+   - 构造每日需求标签（区分预定需求和实际需求）
+   - 处理住宿顺延：将多晚住宿分布到对应日期
+   - 价格统计：基于实际入住订单计算平均价格、标准差等
+
+3. **特征工程模块**
+   - **时间特征**：年、月、日、星期、季度、周数
+   - **滞后特征**：1、2、3、7、14、30天滞后值
+   - **滚动统计**：3、7、14、30天移动平均和标准差
+   - **节假日特征**：周末标识、月初月末标识、季节编码
+   - **需求-价格关系**：价格比率、价格弹性、取消率
+   - **趋势特征**：基于7天窗口的线性趋势
+
+4. **特征列表（50+个特征）**
+   ```python
+   # 基础时间特征（6个）
+   ['year', 'month', 'day', 'dayofweek', 'quarter', 'weekofyear']
+   
+   # 双需求滞后特征（12个）
+   ['booked_demand_lag_1/2/3/7/14/30', 'actual_demand_lag_1/2/3/7/14/30']
+   
+   # 双需求滚动统计（16个）
+   ['booked_demand_ma_3/7/14/30', 'booked_demand_std_3/7/14/30',
+    'actual_demand_ma_3/7/14/30', 'actual_demand_std_3/7/14/30']
+   
+   # 价格相关特征（18个+）
+   ['price_lag_1/2/3/7/14/30', 'price_ma_3/7/14/30', 'price_std_3/7/14/30',
+    'price_range', 'price_cv', 'price_trend', 'cancellation_rate_*']
+   
+   # 节假日和季节性特征（4个）
+   ['is_weekend', 'is_month_start', 'is_month_end', 'season']
+   ```
+
+**使用场景：**
+- **训练阶段**：首次处理原始数据，保存预处理参数
+- **推理阶段**：加载保存的预处理器，确保新数据使用相同的处理规则
+- **模型更新**：保证新旧数据处理方式一致，避免数据漂移
+
+**保存/加载方法：**
+```python
+# 保存预处理器
+preprocessor.save_preprocessor('../02_训练模型/preprocessor.pkl')
+
+# 加载预处理器
+preprocessor = HotelDataPreprocessor.load_preprocessor('../02_训练模型/preprocessor.pkl')
+```
+
+**标准化器说明：**
+- **NGBoost模型中的`feature_scaler`**：专门用于NGBoost模型特征的标准化，在模型训练时fit，在预测时transform
+- **数据预处理器中的`scaler`**：用于整体数据预处理流程的特征标准化，处理更广泛的特征工程pipeline
+
 **注:**  ```rl_system.py``` 中的在线学习,策略评估没有开启使用,为占位函数
 
