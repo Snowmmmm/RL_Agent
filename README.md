@@ -154,7 +154,7 @@ python action_frequency_controller.py --num-runs 30 --max-workers 6 --episodes 4
 #### 参数说明
 
 - `--num-runs`：运行main.py的次数（默认：10）
-- `--max-workers`：最大并行工作进程数（默认：CPU核心数的一半）
+- `--max-workers`：最大并行工作进程数（默认：CPU逻辑处理器数量的一半）
 - `--episodes`：每次运行的训练轮数（默认：300）
 
 #### 工作流程
